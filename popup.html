@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 220px;
+    background: #12121f;
+    color: #dde1f0;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 13px;
+    padding: 16px;
+  }
+  h2 {
+    font-size: 14px;
+    color: #c8cfff;
+    margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: #66bb6a;
+    display: inline-block;
+  }
+  .dot.off { background: #555; }
+  button {
+    all: unset;
+    display: block;
+    width: 100%;
+    background: #1e1e38;
+    color: #9fa8da;
+    border: 1px solid #2e2e52;
+    padding: 8px 12px;
+    border-radius: 7px;
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+    margin-bottom: 8px;
+    text-align: center;
+    transition: background .15s;
+  }
+  button:hover { background: #2e2e52; color: #fff; }
+  button.danger:hover { background: #3a1a1a; color: #ef5350; }
+  .hint {
+    font-size: 10px;
+    color: #444;
+    margin-top: 8px;
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+  <h2><span class="dot" id="dot"></span> API Overlay</h2>
+  <button id="btn-toggle">Hide Panel</button>
+  <button id="btn-pause">⏸ Pause Capture</button>
+  <button id="btn-clear" class="danger">🗑 Clear All Calls</button>
+  <div class="hint">Click any row in the panel to copy the URL. Hover a row to highlight its trigger element on the page.</div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
