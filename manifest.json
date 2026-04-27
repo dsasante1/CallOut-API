@@ -5,9 +5,15 @@
   "description": "See which page elements are making API calls — surfaced directly on the site.",
   "permissions": ["tabs", "activeTab", "scripting", "storage"],
   "host_permissions": ["<all_urls>"],
+  "icons": {
+    "128": "icon128.png"
+  },
   "action": {
     "default_popup": "popup.html",
-    "default_title": "Callout"
+    "default_title": "Callout",
+    "default_icon": {
+      "128": "icon128.png"
+    }
   },
   "content_scripts": [
     {
