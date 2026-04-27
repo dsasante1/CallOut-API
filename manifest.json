@@ -1,13 +1,13 @@
 {
   "manifest_version": 3,
-  "name": "API Endpoint Overlay",
+  "name": "Callout",
   "version": "1.0",
-  "description": "See which page elements are making API calls — overlaid directly on the site.",
+  "description": "See which page elements are making API calls — surfaced directly on the site.",
   "permissions": ["tabs", "activeTab", "scripting", "storage"],
   "host_permissions": ["<all_urls>"],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "API Overlay"
+    "default_title": "Callout"
   },
   "content_scripts": [
     {

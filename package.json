@@ -1,5 +1,5 @@
 {
-  "name": "api-overlay-extension",
+  "name": "callout",
   "version": "1.0.0",
   "scripts": {
     "build": "tsc",
