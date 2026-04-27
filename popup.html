@@ -11,6 +11,7 @@
     font-family: 'SF Mono', 'Fira Code', monospace;
     font-size: 13px;
     padding: 16px;
+    transition: background .2s, color .2s;
   }
   h2 {
     font-size: 14px;
@@ -43,20 +44,41 @@
     font-size: 12px;
     margin-bottom: 8px;
     text-align: center;
-    transition: background .15s;
+    transition: background .15s, color .15s, border-color .15s;
   }
   button:hover { background: #2e2e52; color: #fff; }
   button.danger:hover { background: #3a1a1a; color: #ef5350; }
+  #btn-theme {
+    border-style: dashed;
+    color: #7986cb;
+  }
+  #btn-theme:hover { background: #2a2a6a; color: #c5cae9; border-style: solid; }
   .hint {
     font-size: 10px;
     color: #444;
     margin-top: 8px;
     line-height: 1.6;
   }
+
+  /* ── light theme ── */
+  body[data-theme="light"] { background: #f5f5fb; color: #1a1a2e; }
+  body[data-theme="light"] h2 { color: #3a3a7a; }
+  body[data-theme="light"] button {
+    background: #e0e0f0;
+    color: #4a4a7a;
+    border-color: #c0c0e0;
+  }
+  body[data-theme="light"] button:hover { background: #c8c8e8; color: #1a1a2e; }
+  body[data-theme="light"] button.danger:hover { background: #fce8e8; color: #c62828; }
+  body[data-theme="light"] #btn-theme { color: #5c6bc0; }
+  body[data-theme="light"] #btn-theme:hover { background: #ddddf0; color: #3a3a7a; }
+  body[data-theme="light"] .dot.off { background: #bbb; }
+  body[data-theme="light"] .hint { color: #999; }
 </style>
 </head>
 <body>
   <h2><span class="dot" id="dot"></span> API Overlay</h2>
+  <button id="btn-theme">Light Theme</button>
   <button id="btn-toggle">Hide Panel</button>
   <button id="btn-pause">Pause Capture</button>
   <button id="btn-export">Export HAR</button>
