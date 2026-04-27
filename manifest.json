@@ -3,7 +3,7 @@
   "name": "API Endpoint Overlay",
   "version": "1.0",
   "description": "See which page elements are making API calls — overlaid directly on the site.",
-  "permissions": ["tabs", "activeTab", "scripting"],
+  "permissions": ["tabs", "activeTab", "scripting", "storage"],
   "host_permissions": ["<all_urls>"],
   "action": {
     "default_popup": "popup.html",
