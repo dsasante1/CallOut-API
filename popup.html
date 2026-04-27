@@ -21,10 +21,12 @@
     gap: 6px;
   }
   .dot {
-    width: 8px; height: 8px;
+    width: 8px;
+    height: 8px;
     border-radius: 50%;
     background: #66bb6a;
     display: inline-block;
+    flex-shrink: 0;
   }
   .dot.off { background: #555; }
   button {
@@ -56,10 +58,10 @@
 <body>
   <h2><span class="dot" id="dot"></span> API Overlay</h2>
   <button id="btn-toggle">Hide Panel</button>
-  <button id="btn-pause">⏸ Pause Capture</button>
-  <button id="btn-clear" class="danger">🗑 Clear All Calls</button>
-  <div class="hint">Click any row in the panel to copy the URL. Hover a row to highlight its trigger element on the page.</div>
-
-  <script src="popup.js"></script>
+  <button id="btn-pause">Pause Capture</button>
+  <button id="btn-export">Export HAR</button>
+  <button id="btn-clear" class="danger">Clear All Calls</button>
+  <div class="hint">Click any row to expand payload. Hover to highlight trigger element on page.</div>
+  <script src="dist/popup.js"></script>
 </body>
 </html>

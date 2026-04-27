@@ -12,14 +12,14 @@
   "content_scripts": [
     {
       "matches": ["<all_urls>"],
-      "js": ["content.js"],
+      "js": ["dist/content.js"],
       "run_at": "document_start",
       "all_frames": false
     }
   ],
   "web_accessible_resources": [
     {
-      "resources": ["injected.js"],
+      "resources": ["dist/injected.js"],
       "matches": ["<all_urls>"]
     }
   ]

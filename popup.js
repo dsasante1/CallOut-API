@@ -14,14 +14,18 @@ async function send(action, extra = {}) {
 document.getElementById('btn-toggle').addEventListener('click', async () => {
   visible = !visible;
   document.getElementById('btn-toggle').textContent = visible ? 'Hide Panel' : 'Show Panel';
-  document.getElementById('dot').className = 'dot' + (visible ? '' : ' off');
+  document.getElementById('dot').className = `dot${visible ? '' : ' off'}`;
   await send('toggle');
 });
 
 document.getElementById('btn-pause').addEventListener('click', async () => {
   paused = !paused;
-  document.getElementById('btn-pause').textContent = paused ? '▶ Resume Capture' : '⏸ Pause Capture';
+  document.getElementById('btn-pause').textContent = paused ? 'Resume Capture' : 'Pause Capture';
   await send('pause', { value: paused });
+});
+
+document.getElementById('btn-export').addEventListener('click', async () => {
+  await send('export-har');
 });
 
 document.getElementById('btn-clear').addEventListener('click', async () => {

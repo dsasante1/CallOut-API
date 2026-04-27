@@ -1,49 +1,84 @@
+interface ElementInfo {
+  selector: string;
+  label: string;
+}
+
+interface WsMessage {
+  dir: 'sent' | 'recv';
+  body: string;
+  ts: number;
+}
+
+type RequestStatus = number | 'pending' | 'error' | 'closed';
+
+interface ApiRequest {
+  id: number;
+  url: string;
+  method: string;
+  kind: 'fetch' | 'xhr' | 'ws';
+  status: RequestStatus;
+  element?: ElementInfo | null;
+  ts: number;
+  reqBody?: string | null;
+  resBody?: string | null;
+  messages?: WsMessage[];
+  ms?: number;
+}
+
+interface OverlayMessage extends Partial<ApiRequest> {
+  __apiOverlay?: boolean;
+  __wsMsg?: boolean;
+  wsId?: number;
+  dir?: 'sent' | 'recv';
+  body?: string;
+}
+
 const script = document.createElement('script');
-script.src = chrome.runtime.getURL('injected.js');
+script.src = chrome.runtime.getURL('dist/injected.js');
 (document.head || document.documentElement).prepend(script);
 
-const requests = new Map();
-const expandedIds = new Set();
+const requests = new Map<number, ApiRequest>();
+const expandedIds = new Set<number>();
 let panelVisible = true;
-let activeHighlight = null;
+let activeHighlight: HTMLElement | null = null;
 let paused = false;
 let groupByDomain = false;
 
-window.addEventListener('message', e => {
+window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
   if (!e.data?.__apiOverlay || paused) return;
   const msg = e.data;
 
   if (msg.__wsMsg) {
-    const conn = requests.get(msg.wsId);
+    const conn = requests.get(msg.wsId!);
     if (conn) {
       if (!conn.messages) conn.messages = [];
-      conn.messages.push({ dir: msg.dir, body: msg.body, ts: msg.ts });
+      conn.messages.push({ dir: msg.dir!, body: msg.body!, ts: msg.ts! });
       renderList();
     }
     return;
   }
 
-  if (requests.has(msg.id)) {
-    Object.assign(requests.get(msg.id), msg);
+  if (requests.has(msg.id!)) {
+    Object.assign(requests.get(msg.id!)!, msg);
   } else {
-    requests.set(msg.id, { ...msg });
+    requests.set(msg.id!, { ...msg } as ApiRequest);
   }
 
   renderList();
 
   if (msg.element?.selector && msg.status !== 'pending') {
-    flashBadge(msg);
+    flashBadge(requests.get(msg.id!)!);
   }
 });
 
-chrome.runtime.onMessage.addListener(msg => {
+chrome.runtime.onMessage.addListener((msg: { action: string; value?: boolean }) => {
   if (msg.action === 'toggle') {
     panelVisible = !panelVisible;
     const panel = $('ov-panel');
     if (panel) panel.style.display = panelVisible ? 'flex' : 'none';
   }
   if (msg.action === 'pause') {
-    paused = msg.value;
+    paused = msg.value ?? false;
     const btn = $('ov-pause');
     if (btn) btn.textContent = paused ? 'Resume' : 'Pause';
   }
@@ -58,9 +93,11 @@ chrome.runtime.onMessage.addListener(msg => {
   }
 });
 
-function $(id) { return document.getElementById(id); }
+function $(id: string): HTMLElement | null {
+  return document.getElementById(id);
+}
 
-function buildPanel() {
+function buildPanel(): void {
   if ($('ov-panel')) return;
 
   injectStyles();
@@ -91,26 +128,26 @@ function buildPanel() {
   `;
   document.documentElement.appendChild(panel);
 
-  $('ov-close').onclick = () => { panel.style.display = 'none'; panelVisible = false; };
-  $('ov-clear').onclick = () => { requests.clear(); expandedIds.clear(); clearAllBadges(); renderList(); };
-  $('ov-pause').onclick = () => {
+  $('ov-close')!.onclick = () => { panel.style.display = 'none'; panelVisible = false; };
+  $('ov-clear')!.onclick = () => { requests.clear(); expandedIds.clear(); clearAllBadges(); renderList(); };
+  $('ov-pause')!.onclick = () => {
     paused = !paused;
-    $('ov-pause').textContent = paused ? 'Resume' : 'Pause';
+    $('ov-pause')!.textContent = paused ? 'Resume' : 'Pause';
   };
-  $('ov-filter').oninput = renderList;
-  $('ov-method-filter').onchange = renderList;
-  $('ov-export').onclick = exportHAR;
-  $('ov-group-toggle').onclick = () => {
+  ($('ov-filter') as HTMLInputElement).oninput = renderList;
+  ($('ov-method-filter') as HTMLSelectElement).onchange = renderList;
+  $('ov-export')!.onclick = exportHAR;
+  $('ov-group-toggle')!.onclick = () => {
     groupByDomain = !groupByDomain;
-    $('ov-group-toggle').classList.toggle('ov-active', groupByDomain);
+    $('ov-group-toggle')!.classList.toggle('ov-active', groupByDomain);
     renderList();
   };
 
-  makeDraggable(panel, $('ov-header'));
+  makeDraggable(panel, $('ov-header')!);
   renderList();
 }
 
-function escHtml(str) {
+function escHtml(str: unknown): string {
   return String(str)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -118,20 +155,20 @@ function escHtml(str) {
     .replace(/"/g, '&quot;');
 }
 
-function formatBody(text) {
+function formatBody(text: string | null | undefined): string {
   if (!text) return '';
   const t = text.trimStart();
   if (t.startsWith('{') || t.startsWith('[')) {
-    try { return JSON.stringify(JSON.parse(text), null, 2); } catch {}
+    try { return JSON.stringify(JSON.parse(text), null, 2); } catch { /* fall through */ }
   }
   return text;
 }
 
-function getHostname(url) {
+function getHostname(url: string): string {
   try { return new URL(url).hostname; } catch { return 'unknown'; }
 }
 
-function rowHtml(req) {
+function rowHtml(req: ApiRequest): string {
   const shortUrl = (() => {
     try {
       const u = new URL(req.url);
@@ -207,19 +244,19 @@ function rowHtml(req) {
   </div>`;
 }
 
-function renderList() {
+function renderList(): void {
   const list = $('ov-list');
   const countEl = $('ov-count');
   if (!list) return;
 
-  const filterText = ($('ov-filter')?.value || '').toLowerCase();
-  const filterMethod = $('ov-method-filter')?.value || '';
+  const filterText = (($('ov-filter') as HTMLInputElement)?.value || '').toLowerCase();
+  const filterMethod = ($('ov-method-filter') as HTMLSelectElement)?.value || '';
 
   let items = [...requests.values()].reverse();
   if (filterText) items = items.filter(r => r.url?.toLowerCase().includes(filterText));
   if (filterMethod) items = items.filter(r => r.method === filterMethod);
 
-  if (countEl) countEl.textContent = requests.size;
+  if (countEl) countEl.textContent = String(requests.size);
 
   if (items.length === 0) {
     list.innerHTML = `<div class="ov-empty">${
@@ -233,11 +270,11 @@ function renderList() {
   const visible = items.slice(0, 200);
 
   if (groupByDomain) {
-    const groups = new Map();
+    const groups = new Map<string, ApiRequest[]>();
     for (const req of visible) {
       const host = getHostname(req.url);
       if (!groups.has(host)) groups.set(host, []);
-      groups.get(host).push(req);
+      groups.get(host)!.push(req);
     }
 
     const pageHost = location.hostname;
@@ -266,8 +303,8 @@ function renderList() {
   attachRowEvents(list);
 }
 
-function attachRowEvents(list) {
-  list.querySelectorAll('.ov-row').forEach(row => {
+function attachRowEvents(list: HTMLElement): void {
+  list.querySelectorAll<HTMLElement>('.ov-row').forEach(row => {
     row.addEventListener('mouseenter', () => {
       const sel = decodeURIComponent(row.dataset.sel || '');
       if (sel) highlightEl(sel);
@@ -276,8 +313,8 @@ function attachRowEvents(list) {
 
     const main = row.querySelector('.ov-row-main');
     if (main) {
-      main.addEventListener('click', e => {
-        if (e.target.closest('.ov-copy-btn')) return;
+      main.addEventListener('click', (e: Event) => {
+        if ((e.target as Element).closest('.ov-copy-btn')) return;
         const id = Number(row.dataset.id);
         if (expandedIds.has(id)) expandedIds.delete(id);
         else expandedIds.add(id);
@@ -286,8 +323,8 @@ function attachRowEvents(list) {
     }
   });
 
-  list.querySelectorAll('.ov-copy-btn').forEach(btn => {
-    btn.addEventListener('click', e => {
+  list.querySelectorAll<HTMLElement>('.ov-copy-btn').forEach(btn => {
+    btn.addEventListener('click', (e: Event) => {
       e.stopPropagation();
       const url = decodeURIComponent(btn.dataset.url || '');
       navigator.clipboard?.writeText(url).catch(() => {});
@@ -297,13 +334,13 @@ function attachRowEvents(list) {
   });
 }
 
-function exportHAR() {
-  function parseQuery(url) {
+function exportHAR(): void {
+  function parseQuery(url: string): { name: string; value: string }[] {
     try { return [...new URL(url).searchParams.entries()].map(([name, value]) => ({ name, value })); }
     catch { return []; }
   }
 
-  function detectMime(body) {
+  function detectMime(body: string | null | undefined): string {
     if (!body) return 'text/plain';
     const t = body.trimStart();
     if (t.startsWith('{') || t.startsWith('[')) return 'application/json';
@@ -328,7 +365,7 @@ function exportHAR() {
         ...(r.reqBody ? { postData: { mimeType: detectMime(r.reqBody), text: r.reqBody } } : {})
       },
       response: {
-        status: r.status,
+        status: r.status as number,
         statusText: '',
         httpVersion: 'HTTP/1.1',
         headers: [],
@@ -366,27 +403,27 @@ function exportHAR() {
   URL.revokeObjectURL(blobUrl);
 }
 
-function highlightEl(selector) {
+function highlightEl(selector: string): void {
   clearHighlight();
   try {
-    const el = document.querySelector(selector);
+    const el = document.querySelector<HTMLElement>(selector);
     if (!el || el.closest('#ov-panel')) return;
     el.classList.add('ov-highlighted');
     activeHighlight = el;
     el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-  } catch {}
+  } catch { /* invalid selector */ }
 }
 
-function clearHighlight() {
+function clearHighlight(): void {
   if (activeHighlight) {
     activeHighlight.classList.remove('ov-highlighted');
     activeHighlight = null;
   }
 }
 
-const badges = new Map();
+const badges = new Map<number, HTMLDivElement>();
 
-function flashBadge(req) {
+function flashBadge(req: ApiRequest): void {
   if (!req.element?.selector) return;
   try {
     const el = document.querySelector(req.element.selector);
@@ -395,14 +432,14 @@ function flashBadge(req) {
     if (!rect.width && !rect.height) return;
 
     const key = req.id;
-    if (badges.has(key)) badges.get(key).remove();
+    if (badges.has(key)) badges.get(key)!.remove();
 
     const badge = document.createElement('div');
     badge.className = 'ov-float-badge';
     badge.dataset.method = req.method?.toLowerCase();
 
     let label = req.url;
-    try { label = new URL(req.url).pathname; } catch {}
+    try { label = new URL(req.url).pathname; } catch { /* use full url */ }
     badge.textContent = `${req.method} ${label}`;
 
     badge.style.cssText = `top:${window.scrollY + rect.top - 22}px;left:${window.scrollX + rect.left}px;`;
@@ -410,23 +447,24 @@ function flashBadge(req) {
     badges.set(key, badge);
 
     setTimeout(() => { badge.remove(); badges.delete(key); }, 5000);
-  } catch {}
+  } catch { /* invalid selector */ }
 }
 
-function clearAllBadges() {
+function clearAllBadges(): void {
   badges.forEach(b => b.remove());
   badges.clear();
   document.querySelectorAll('.ov-float-badge').forEach(b => b.remove());
 }
 
-function makeDraggable(panel, handle) {
-  let ox, oy;
-  handle.addEventListener('mousedown', e => {
-    if (e.target.tagName === 'BUTTON') return;
+function makeDraggable(panel: HTMLElement, handle: HTMLElement): void {
+  let ox = 0;
+  let oy = 0;
+  handle.addEventListener('mousedown', (e: MouseEvent) => {
+    if ((e.target as HTMLElement).tagName === 'BUTTON') return;
     e.preventDefault();
     ox = e.clientX - panel.getBoundingClientRect().left;
     oy = e.clientY - panel.getBoundingClientRect().top;
-    const move = ev => {
+    const move = (ev: MouseEvent) => {
       panel.style.left = (ev.clientX - ox) + 'px';
       panel.style.top = (ev.clientY - oy) + 'px';
       panel.style.right = 'auto';
@@ -441,7 +479,7 @@ function makeDraggable(panel, handle) {
   });
 }
 
-function injectStyles() {
+function injectStyles(): void {
   if ($('ov-styles')) return;
   const s = document.createElement('style');
   s.id = 'ov-styles';
