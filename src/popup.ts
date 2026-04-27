@@ -22,14 +22,44 @@ function applyPopupTheme(theme: 'dark' | 'light'): void {
   btnTheme.textContent = theme === 'dark' ? 'Light Theme' : 'Dark Theme';
 }
 
+function applyVisibleState(v: boolean): void {
+  visible = v;
+  btnToggle.textContent = v ? 'Hide Panel' : 'Show Panel';
+  dot.className = `dot${v ? '' : ' off'}`;
+}
+
+function applyPausedState(p: boolean): void {
+  capturePaused = p;
+  btnPause.textContent = p ? 'Resume Capture' : 'Pause Capture';
+}
+
 const btnTheme = document.getElementById('btn-theme') as HTMLButtonElement;
 const btnToggle = document.getElementById('btn-toggle') as HTMLButtonElement;
 const btnPause = document.getElementById('btn-pause') as HTMLButtonElement;
 const dot = document.getElementById('dot') as HTMLElement;
 
-chrome.storage.local.get('ovTheme', result => {
-  applyPopupTheme((result['ovTheme'] as 'dark' | 'light') || 'dark');
-});
+// Sync state from the live content script; fall back to storage if tab isn't reachable
+async function syncState(): Promise<void> {
+  const tab = await getTab();
+  if (tab?.id != null) {
+    chrome.tabs.sendMessage(tab.id, { action: 'get-state' }, response => {
+      if (chrome.runtime.lastError || !response) {
+        // content script not ready — fall back to storage
+        chrome.storage.local.get(['ovTheme', 'ovVisible', 'ovPaused'], ({ ovTheme, ovVisible, ovPaused }) => {
+          applyPopupTheme((ovTheme as 'dark' | 'light') || 'dark');
+          applyVisibleState(ovVisible !== false);
+          applyPausedState(ovPaused === true);
+        });
+        return;
+      }
+      applyPopupTheme(response.theme || 'dark');
+      applyVisibleState(response.visible !== false);
+      applyPausedState(response.paused === true);
+    });
+  }
+}
+
+syncState();
 
 btnTheme.addEventListener('click', async () => {
   const next: 'dark' | 'light' = popupTheme === 'dark' ? 'light' : 'dark';

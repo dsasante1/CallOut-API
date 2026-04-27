@@ -74,14 +74,20 @@ window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
   }
 });
 
-chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }) => {
+chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, _sender, sendResponse) => {
+  if (msg.action === 'get-state') {
+    sendResponse({ visible: panelVisible, paused, theme: currentTheme });
+    return true;
+  }
   if (msg.action === 'toggle') {
     panelVisible = !panelVisible;
+    chrome.storage.local.set({ ovVisible: panelVisible });
     const panel = $('ov-panel');
     if (panel) panel.style.setProperty('display', panelVisible ? 'flex' : 'none', 'important');
   }
   if (msg.action === 'pause') {
     paused = (msg.value as boolean) ?? false;
+    chrome.storage.local.set({ ovPaused: paused });
     const btn = $('ov-pause');
     if (btn) btn.textContent = paused ? 'Resume' : 'Pause';
   }
@@ -156,11 +162,16 @@ function buildPanel(): void {
   `;
   document.documentElement.appendChild(panel);
 
-  $('ov-close')!.onclick = () => { panel.style.setProperty('display', 'none', 'important'); panelVisible = false; };
+  $('ov-close')!.onclick = () => {
+    panel.style.setProperty('display', 'none', 'important');
+    panelVisible = false;
+    chrome.storage.local.set({ ovVisible: false });
+  };
   $('ov-clear')!.onclick = () => { requests.clear(); expandedIds.clear(); clearAllBadges(); renderList(); };
   $('ov-pause')!.onclick = () => {
     paused = !paused;
     $('ov-pause')!.textContent = paused ? 'Resume' : 'Pause';
+    chrome.storage.local.set({ ovPaused: paused });
   };
   $('ov-theme')!.onclick = () => {
     const next: 'dark' | 'light' = currentTheme === 'dark' ? 'light' : 'dark';
