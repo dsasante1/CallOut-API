@@ -127,7 +127,10 @@ interface XMLHttpRequest {
     emit({ id, url, method, kind: 'xhr', status: 'pending', element: elementInfo(el), ts: t0, reqBody });
 
     this.addEventListener('load', () => {
-      emit({ id, url, method, kind: 'xhr', status: this.status, ms: Date.now() - t0, element: elementInfo(el), ts: t0, reqBody, resBody: this.responseText?.slice(0, 50000) });
+      const resBody = (this.responseType === '' || this.responseType === 'text')
+        ? this.responseText?.slice(0, 50000)
+        : null;
+      emit({ id, url, method, kind: 'xhr', status: this.status, ms: Date.now() - t0, element: elementInfo(el), ts: t0, reqBody, resBody });
     });
     this.addEventListener('error', () => {
       emit({ id, url, method, kind: 'xhr', status: 'error', ms: Date.now() - t0, element: elementInfo(el), ts: t0, reqBody });

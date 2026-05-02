@@ -35,10 +35,6 @@ interface OverlayMessage extends Partial<ApiRequest> {
   body?: string;
 }
 
-const script = document.createElement('script');
-script.src = chrome.runtime.getURL('dist/injected.js');
-(document.head || document.documentElement).prepend(script);
-
 const requests = new Map<number, ApiRequest>();
 const expandedIds = new Set<number>();
 let panelVisible = true;
@@ -46,9 +42,10 @@ let activeHighlight: HTMLElement | null = null;
 let paused = false;
 let groupByDomain = false;
 let currentTheme: 'dark' | 'light' = 'dark';
+let activated = false;
 
 window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
-  if (!e.data?.__apiOverlay || paused) return;
+  if (!e.data?.__apiOverlay || !activated || paused) return;
   const msg = e.data;
 
   if (msg.__wsMsg) {
@@ -76,7 +73,17 @@ window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
 
 chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, _sender, sendResponse) => {
   if (msg.action === 'get-state') {
-    sendResponse({ visible: panelVisible, paused, theme: currentTheme });
+    sendResponse({ visible: panelVisible, paused, theme: currentTheme, activated });
+    return true;
+  }
+  if (msg.action === 'activate') {
+    activateOverlay();
+    sendResponse({ activated });
+    return true;
+  }
+  if (msg.action === 'deactivate') {
+    deactivateOverlay();
+    sendResponse({ activated });
     return true;
   }
   if (msg.action === 'toggle') {
@@ -933,10 +940,33 @@ function injectStyles(): void {
   document.documentElement.appendChild(s);
 }
 
-if (document.body) {
-  loadTheme().then(theme => { currentTheme = theme; buildPanel(); });
-} else {
-  document.addEventListener('DOMContentLoaded', () => {
+function activateOverlay(): void {
+  if (activated) return;
+  activated = true;
+  const script = document.createElement('script');
+  script.src = chrome.runtime.getURL('dist/injected.js');
+  (document.head || document.documentElement).prepend(script);
+  if (document.body) {
     loadTheme().then(theme => { currentTheme = theme; buildPanel(); });
-  }, { once: true });
+  } else {
+    document.addEventListener('DOMContentLoaded', () => {
+      loadTheme().then(theme => { currentTheme = theme; buildPanel(); });
+    }, { once: true });
+  }
 }
+
+function deactivateOverlay(): void {
+  if (!activated) return;
+  activated = false;
+  document.getElementById('ov-panel')?.remove();
+  document.getElementById('ov-styles')?.remove();
+  clearAllBadges();
+  requests.clear();
+  expandedIds.clear();
+}
+
+chrome.storage.local.get('ovAllowedHosts', ({ ovAllowedHosts }) => {
+  if ((ovAllowedHosts as string[] ?? []).includes(location.hostname)) {
+    activateOverlay();
+  }
+});
