@@ -4,9 +4,10 @@ A Chrome extension that intercepts and displays all API calls made by a web page
 
 ## Features
 
+- **Allowlist-only activation** — the overlay is completely dormant on all sites by default; you explicitly add hostnames you want to inspect
 - **Live request capture** — intercepts `fetch`, `XMLHttpRequest`, and `WebSocket` traffic in real time
 - **Trigger element linking** — identifies which DOM element the user interacted with that caused each request, with hover-to-highlight on page
-- **Floating overlay panel** — draggable, dark-themed panel rendered on top of any site; no DevTools required
+- **Floating overlay panel** — draggable, dark/light-themed panel rendered on top of any allowed site; no DevTools required
 - **Request/response body preview** — click any row to expand and see payload; JSON is auto-pretty-printed
 - **WebSocket support** — tracks connection lifecycle and shows a scrollable sent/received message thread
 - **URL filtering and method filtering** — filter the list by URL substring or HTTP method (GET, POST, PUT, DELETE, PATCH, WS)
@@ -43,11 +44,12 @@ The extension uses a two-script architecture required by Manifest V3's content s
 
 2. **`content.ts`** runs in the **content script world** (isolated from the page). It listens for those `window.postMessage` events and builds the overlay panel into the page DOM. It also tracks interaction state (hover → highlight, expand/collapse rows) and responds to commands from the popup.
 
-3. **`popup.ts`** controls the extension popup, which sends `chrome.tabs.sendMessage` commands (`toggle`, `pause`, `clear`, `export-har`) to the content script.
+3. **`popup.ts`** controls the extension popup, which sends `chrome.tabs.sendMessage` commands (`activate`, `deactivate`, `toggle`, `pause`, `clear`, `export-har`) to the content script. It also manages the `ovAllowedHosts` allowlist in `chrome.storage.local`.
 
 ```
 Page JS ──postMessage──▶ content.ts ──renders──▶ overlay panel
                                   ◀──sendMessage── popup.ts
+                   chrome.storage (ovAllowedHosts) ──▶ content.ts init
 ```
 
 ## Installation
@@ -76,7 +78,7 @@ Page JS ──postMessage──▶ content.ts ──renders──▶ overlay pan
    - Click **Load unpacked**
    - Select the `api-overlay-extension/` directory
 
-The extension is now active on all sites.
+The extension is now installed. No sites are active yet — see [Usage](#usage) to add your first site.
 
 ## Development
 
@@ -92,7 +94,18 @@ After each `build`, reload the extension in `chrome://extensions` (click the ref
 
 ## Usage
 
-Once installed, visit any website. The overlay panel appears in the bottom-right corner automatically.
+The overlay is opt-in — it only activates on sites you explicitly allow.
+
+### Adding a site
+
+1. Click the **CalloutAPI** extension icon to open the popup.
+2. The **Allowed Sites** input is pre-filled with the current tab's hostname.
+3. Press **Add** (or Enter) to enable the overlay on that site — the panel appears immediately without a page reload.
+4. To remove a site, click the **×** next to it in the list — the panel disappears live on that tab.
+
+> The panel controls (Hide, Pause, Export HAR, Clear) are greyed out when the current site is not in the allowlist. The **Theme** toggle is always available.
+
+### Panel controls
 
 | Action | How |
 |---|---|
@@ -106,6 +119,7 @@ Once installed, visit any website. The overlay panel appears in the bottom-right
 | Clear all requests | Click **Clear** in the panel or popup |
 | Export as HAR | Click **Export HAR** in the panel or popup |
 | Hide/show panel | Click **Hide Panel** / **Show Panel** in the popup |
+| Switch theme | Click **Light Theme** / **Dark Theme** in the popup |
 | Move the panel | Drag the header bar |
 
 ## HAR Export
@@ -121,15 +135,19 @@ The **Export HAR** action generates a [HTTP Archive (HAR 1.2)](https://w3c.githu
 
 | Permission | Purpose |
 |---|---|
-| `tabs` | Read the active tab ID to send messages from the popup |
+| `tabs` | Read the active tab URL and ID to pre-fill the hostname input and send messages from the popup |
 | `activeTab` | Scope message sending to the current tab |
-| `scripting` | Inject the page-world script (`injected.js`) |
-| `host_permissions: <all_urls>` | Allow content scripts and `web_accessible_resources` on all sites |
+| `storage` | Persist the `ovAllowedHosts` allowlist and UI preferences (theme, visibility, pause state) across sessions |
+| `host_permissions: <all_urls>` | Allow the content script to load on all sites so it can receive an `activate` message when a hostname is added to the allowlist |
 
 ## Technical Notes
 
-- The injected script is guarded by `window.__apiOverlayActive` to prevent double-injection on navigation.
-- Trigger element detection uses a 800 ms window from the last `mousedown`/`touchstart`/`keydown` event. Requests made outside that window are attributed to "background / auto".
+- **Allowlist storage key:** `ovAllowedHosts` (`string[]`) in `chrome.storage.local` — matched against `location.hostname` on every page load.
+- On pages not in the allowlist the content script loads but does nothing: no script injection, no DOM modification, no event listeners beyond the `activate` message handler.
+- When a hostname is added via the popup while that tab is open, an `activate` message is sent and the overlay appears live; no page reload required. Removing a hostname sends `deactivate`, which tears down the panel immediately.
+- The injected script is guarded by `window.__apiOverlayActive` to prevent double-injection if `activate` is sent more than once.
+- XHR responses are only read as text when `responseType` is `''` or `'text'`; binary types (`arraybuffer`, `blob`) are captured as no body to avoid `InvalidStateError`.
+- Trigger element detection uses an 800 ms window from the last `mousedown`/`touchstart`/`keydown` event. Requests made outside that window are attributed to "background / auto".
 - CSS is injected with `!important` on every rule to avoid style bleed from the host page overriding the panel.
 - Request/response bodies are capped at 50 000 characters; WebSocket messages at 10 000 characters.
 - The panel renders at most 200 requests at a time (newest first) to keep the DOM lightweight.
