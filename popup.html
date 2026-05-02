@@ -75,15 +75,121 @@
   body[data-theme="light"] #btn-theme:hover { background: #ddddf0; color: #3a3a7a; }
   body[data-theme="light"] .dot.off { background: #bbb; }
   body[data-theme="light"] .hint { color: #999; }
+
+  .divider {
+    border: none;
+    border-top: 1px solid #2a2a45;
+    margin: 12px 0;
+  }
+  .section-label {
+    font-size: 10px;
+    color: #555;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    margin-bottom: 8px;
+  }
+  #host-add-row {
+    display: flex;
+    gap: 6px;
+    margin-bottom: 8px;
+  }
+  #host-input {
+    all: unset;
+    flex: 1;
+    background: #1a1a30;
+    border: 1px solid #2e2e52;
+    color: #dde1f0;
+    padding: 6px 9px;
+    border-radius: 6px;
+    font-family: inherit;
+    font-size: 11px;
+    box-sizing: border-box;
+    min-width: 0;
+  }
+  #host-input::placeholder { color: #444; }
+  #btn-add-host {
+    width: auto;
+    padding: 6px 12px;
+    margin-bottom: 0;
+    font-size: 11px;
+    flex-shrink: 0;
+  }
+  #host-list {
+    max-height: 110px;
+    overflow-y: auto;
+    margin-bottom: 10px;
+  }
+  #host-list::-webkit-scrollbar { width: 3px; }
+  #host-list::-webkit-scrollbar-thumb { background: #2e2e52; border-radius: 3px; }
+  .host-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 5px 8px;
+    margin-bottom: 4px;
+    background: #1e1e38;
+    border-radius: 6px;
+    font-size: 11px;
+    color: #9fa8da;
+  }
+  .host-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex: 1;
+  }
+  .host-remove {
+    all: unset;
+    color: #555;
+    cursor: pointer;
+    padding: 0 4px;
+    font-size: 15px;
+    line-height: 1;
+    flex-shrink: 0;
+    margin-left: 6px;
+  }
+  .host-remove:hover { color: #ef5350; }
+  .host-empty {
+    font-size: 10px;
+    color: #444;
+    text-align: center;
+    padding: 8px 0;
+    font-style: italic;
+  }
+  #controls-section.disabled button:not(#btn-theme) {
+    opacity: 0.38;
+    pointer-events: none;
+  }
+
+  body[data-theme="light"] .divider { border-top-color: #d0d0e8; }
+  body[data-theme="light"] .section-label { color: #aaa; }
+  body[data-theme="light"] #host-input {
+    background: #f0f0fa;
+    border-color: #c0c0e0;
+    color: #1a1a2e;
+  }
+  body[data-theme="light"] #host-input::placeholder { color: #bbb; }
+  body[data-theme="light"] .host-item { background: #e8e8f5; color: #4a4a7a; }
+  body[data-theme="light"] .host-remove { color: #bbb; }
+  body[data-theme="light"] .host-remove:hover { color: #c62828; }
 </style>
 </head>
 <body>
   <h2><span class="dot" id="dot"></span> API Overlay</h2>
-  <button id="btn-theme">Light Theme</button>
-  <button id="btn-toggle">Hide Panel</button>
-  <button id="btn-pause">Pause Capture</button>
-  <button id="btn-export">Export HAR</button>
-  <button id="btn-clear" class="danger">Clear All Calls</button>
+  <div id="controls-section">
+    <button id="btn-theme">Light Theme</button>
+    <button id="btn-toggle">Hide Panel</button>
+    <button id="btn-pause">Pause Capture</button>
+    <button id="btn-export">Export HAR</button>
+    <button id="btn-clear" class="danger">Clear All Calls</button>
+  </div>
+  <hr class="divider"/>
+  <div class="section-label">Allowed Sites</div>
+  <div id="host-add-row">
+    <input id="host-input" placeholder="hostname.com" autocomplete="off" spellcheck="false"/>
+    <button id="btn-add-host">Add</button>
+  </div>
+  <div id="host-list"></div>
   <div class="hint">Click any row to expand payload. Hover to highlight trigger element on page.</div>
   <script src="dist/popup.js"></script>
 </body>

@@ -26,3 +26,12 @@ export function extractBody(body: BodyInit | null | undefined): string | null {
   if (body instanceof FormData) return '[FormData]';
   return '[Binary]';
 }
+
+export function getTabHostname(tab: { url?: string } | undefined): string {
+  try { return tab?.url ? new URL(tab.url).hostname : ''; } catch { return ''; }
+}
+
+export function safeReadResponseText(responseType: string, responseText: string): string | null {
+  if (responseType === '' || responseType === 'text') return responseText.slice(0, 50000);
+  return null;
+}
