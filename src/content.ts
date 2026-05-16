@@ -35,86 +35,183 @@ interface OverlayMessage extends Partial<ApiRequest> {
   body?: string;
 }
 
+const MAX_REQUESTS = 1000;
+const MAX_WS_MESSAGES_PER_CONN = 500;
+const WS_TRIM_TRIGGER = MAX_WS_MESSAGES_PER_CONN + 50;
+const RENDER_LIMIT = 200;
+const RENDER_THROTTLE_MS = 100;
+
 const requests = new Map<number, ApiRequest>();
 const expandedIds = new Set<number>();
+const badgeTimers = new Map<number, number>();
 let panelVisible = true;
 let activeHighlight: HTMLElement | null = null;
 let paused = false;
 let groupByDomain = false;
 let currentTheme: 'dark' | 'light' = 'dark';
 let activated = false;
+let cspBlocked = false;
+let renderScheduled = false;
+let renderTimer: number | null = null;
+let lastRenderTime = 0;
+let filterInput: HTMLInputElement | null = null;
+let methodFilterSelect: HTMLSelectElement | null = null;
+
+function scheduleRender(): void {
+  if (renderScheduled) return;
+  renderScheduled = true;
+  const elapsed = Date.now() - lastRenderTime;
+  const delay = Math.max(0, RENDER_THROTTLE_MS - elapsed);
+  renderTimer = window.setTimeout(() => {
+    renderTimer = null;
+    renderScheduled = false;
+    lastRenderTime = Date.now();
+    renderList();
+  }, delay);
+}
+
+// Use for data-driven renders that should freeze when the user pauses capture.
+// User actions (row click, filter typing) call scheduleRender() directly so they
+// still respond while paused.
+function scheduleRenderUnlessPaused(): void {
+  if (paused) return;
+  scheduleRender();
+}
+
+function cancelScheduledRender(): void {
+  if (renderTimer !== null) {
+    clearTimeout(renderTimer);
+    renderTimer = null;
+  }
+  renderScheduled = false;
+}
+
+function trimRequests(): void {
+  if (requests.size <= MAX_REQUESTS) return;
+  const overflow = requests.size - MAX_REQUESTS;
+  const iter = requests.keys();
+  for (let i = 0; i < overflow; i++) {
+    const k = iter.next().value as number | undefined;
+    if (k === undefined) break;
+    requests.delete(k);
+    expandedIds.delete(k);
+    const timer = badgeTimers.get(k);
+    if (timer !== undefined) {
+      clearTimeout(timer);
+      badgeTimers.delete(k);
+    }
+    badges.get(k)?.remove();
+    badges.delete(k);
+  }
+}
 
 window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
-  if (!e.data?.__apiOverlay || !activated || paused) return;
+  if (e.source !== window) return;
+  if (!e.data?.__apiOverlay || !activated) return;
   const msg = e.data;
 
   if (msg.__wsMsg) {
-    const conn = requests.get(msg.wsId!);
+    if (msg.wsId == null) return;
+    const conn = requests.get(msg.wsId);
     if (conn) {
       if (!conn.messages) conn.messages = [];
-      conn.messages.push({ dir: msg.dir!, body: msg.body!, ts: msg.ts! });
-      renderList();
+      if (msg.dir && msg.body != null && msg.ts != null) {
+        conn.messages.push({ dir: msg.dir, body: msg.body, ts: msg.ts });
+      }
+      // Trim in chunks so steady-state pushes are O(1), not O(n).
+      if (conn.messages.length > WS_TRIM_TRIGGER) {
+        conn.messages.splice(0, conn.messages.length - MAX_WS_MESSAGES_PER_CONN);
+      }
+      if (expandedIds.has(conn.id)) scheduleRenderUnlessPaused();
     }
     return;
   }
 
-  if (requests.has(msg.id!)) {
-    Object.assign(requests.get(msg.id!)!, msg);
+  if (msg.id == null) return;
+
+  if (requests.has(msg.id)) {
+    Object.assign(requests.get(msg.id)!, msg);
   } else {
-    requests.set(msg.id!, { ...msg } as ApiRequest);
+    if (paused) return; // drop new captures only; keep merging updates to in-flight ones.
+    requests.set(msg.id, { ...msg } as ApiRequest);
+    trimRequests();
   }
 
-  renderList();
+  scheduleRenderUnlessPaused();
 
-  if (msg.element?.selector && msg.status !== 'pending') {
-    flashBadge(requests.get(msg.id!)!);
+  if (!paused && msg.element?.selector && msg.status !== 'pending') {
+    const req = requests.get(msg.id);
+    if (req) flashBadge(req);
   }
 });
 
 chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, _sender, sendResponse) => {
-  if (msg.action === 'get-state') {
-    sendResponse({ visible: panelVisible, paused, theme: currentTheme, activated });
-    return true;
+  switch (msg.action) {
+    case 'get-state':
+      sendResponse({ visible: panelVisible, paused, theme: currentTheme, activated });
+      break;
+    case 'activate':
+      activateOverlay();
+      sendResponse({ activated });
+      break;
+    case 'deactivate':
+      deactivateOverlay();
+      sendResponse({ activated });
+      break;
+    case 'toggle': {
+      panelVisible = !panelVisible;
+      chrome.storage.local.set({ ovVisible: panelVisible });
+      const panel = $('ov-panel');
+      if (panel) panel.style.setProperty('display', panelVisible ? 'flex' : 'none', 'important');
+      sendResponse({ visible: panelVisible });
+      break;
+    }
+    case 'pause': {
+      const next = (msg.value as boolean) ?? false;
+      setPaused(next);
+      sendResponse({ paused });
+      break;
+    }
+    case 'clear':
+      requests.clear();
+      expandedIds.clear();
+      clearAllBadges();
+      renderList();
+      sendResponse({ ok: true });
+      break;
+    case 'export-har':
+      exportHAR();
+      sendResponse({ ok: true });
+      break;
+    case 'theme': {
+      const theme = msg.value as 'dark' | 'light';
+      if (theme === 'dark' || theme === 'light') {
+        chrome.storage.local.set({ ovTheme: theme });
+        applyTheme(theme);
+      }
+      sendResponse({ theme: currentTheme });
+      break;
+    }
+    default:
+      console.warn('[CalloutAPI] unknown action received:', msg.action);
+      sendResponse({ ok: false });
   }
-  if (msg.action === 'activate') {
-    activateOverlay();
-    sendResponse({ activated });
-    return true;
-  }
-  if (msg.action === 'deactivate') {
-    deactivateOverlay();
-    sendResponse({ activated });
-    return true;
-  }
-  if (msg.action === 'toggle') {
-    panelVisible = !panelVisible;
-    chrome.storage.local.set({ ovVisible: panelVisible });
-    const panel = $('ov-panel');
-    if (panel) panel.style.setProperty('display', panelVisible ? 'flex' : 'none', 'important');
-  }
-  if (msg.action === 'pause') {
-    paused = (msg.value as boolean) ?? false;
-    chrome.storage.local.set({ ovPaused: paused });
-    const btn = $('ov-pause');
-    if (btn) btn.textContent = paused ? 'Resume' : 'Pause';
-  }
-  if (msg.action === 'clear') {
-    requests.clear();
-    expandedIds.clear();
-    clearAllBadges();
+  // Synchronous response — do not return true (which would leave the channel open).
+});
+
+function setPaused(next: boolean): void {
+  if (next === paused) return;
+  const wasPaused = paused;
+  paused = next;
+  chrome.storage.local.set({ ovPaused: paused });
+  signalInjected(paused ? 'pause' : 'resume');
+  const btn = $('ov-pause');
+  if (btn) btn.textContent = paused ? 'Resume' : 'Pause';
+  if (wasPaused && !paused) {
+    // On resume, render any updates that arrived while paused.
     renderList();
   }
-  if (msg.action === 'export-har') {
-    exportHAR();
-  }
-  if (msg.action === 'theme') {
-    const theme = msg.value as 'dark' | 'light';
-    if (theme === 'dark' || theme === 'light') {
-      chrome.storage.local.set({ ovTheme: theme });
-      applyTheme(theme);
-    }
-  }
-});
+}
 
 function $(id: string): HTMLElement | null {
   return document.getElementById(id);
@@ -149,7 +246,7 @@ function buildPanel(): void {
       <span id="ov-title">API Overlay <span id="ov-count" class="ov-badge">0</span></span>
       <div id="ov-actions">
         <button id="ov-theme">${currentTheme === 'dark' ? 'Light' : 'Dark'}</button>
-        <button id="ov-pause">Pause</button>
+        <button id="ov-pause">${paused ? 'Resume' : 'Pause'}</button>
         <button id="ov-export">Export HAR</button>
         <button id="ov-clear">Clear</button>
         <button id="ov-close">x</button>
@@ -167,7 +264,11 @@ function buildPanel(): void {
     <div id="ov-list"></div>
     <div id="ov-footer">Click row to expand payload. Hover to highlight trigger element.</div>
   `;
+  if (!panelVisible) panel.style.setProperty('display', 'none', 'important');
   document.documentElement.appendChild(panel);
+
+  filterInput = $('ov-filter') as HTMLInputElement;
+  methodFilterSelect = $('ov-method-filter') as HTMLSelectElement;
 
   $('ov-close')!.onclick = () => {
     panel.style.setProperty('display', 'none', 'important');
@@ -175,18 +276,14 @@ function buildPanel(): void {
     chrome.storage.local.set({ ovVisible: false });
   };
   $('ov-clear')!.onclick = () => { requests.clear(); expandedIds.clear(); clearAllBadges(); renderList(); };
-  $('ov-pause')!.onclick = () => {
-    paused = !paused;
-    $('ov-pause')!.textContent = paused ? 'Resume' : 'Pause';
-    chrome.storage.local.set({ ovPaused: paused });
-  };
+  $('ov-pause')!.onclick = () => setPaused(!paused);
   $('ov-theme')!.onclick = () => {
     const next: 'dark' | 'light' = currentTheme === 'dark' ? 'light' : 'dark';
     chrome.storage.local.set({ ovTheme: next });
     applyTheme(next);
   };
-  ($('ov-filter') as HTMLInputElement).oninput = renderList;
-  ($('ov-method-filter') as HTMLSelectElement).onchange = renderList;
+  filterInput.oninput = () => scheduleRender();
+  methodFilterSelect.onchange = renderList;
   $('ov-export')!.onclick = exportHAR;
   $('ov-group-toggle')!.onclick = () => {
     groupByDomain = !groupByDomain;
@@ -195,15 +292,31 @@ function buildPanel(): void {
   };
 
   makeDraggable(panel, $('ov-header')!);
+  const list = $('ov-list');
+  if (list) bindListDelegation(list);
   renderList();
 }
 
+// The following helpers are duplicated in popup.ts (as popupEscHtml, normalizeHost, etc.)
+// because the no-bundler tsc build (module: "None") emits each entry point as a
+// standalone script — there's no shared module that all three (content/popup/injected)
+// can import from. Keep changes here in sync with the copies in those files.
 function escHtml(str: unknown): string {
   return String(str)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+const VALID_HTTP_METHODS = new Set([
+  'GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'HEAD', 'OPTIONS', 'WS'
+]);
+
+function safeMethodClass(method: string | null | undefined): string {
+  const m = String(method ?? 'GET').toUpperCase();
+  return VALID_HTTP_METHODS.has(m) ? m.toLowerCase() : 'unknown';
 }
 
 function formatBody(text: string | null | undefined): string {
@@ -278,7 +391,7 @@ function rowHtml(req: ApiRequest): string {
 
   return `<div class="ov-row${isExpanded ? ' ov-expanded' : ''}" data-id="${req.id}" data-sel="${encodeURIComponent(req.element?.selector || '')}">
     <div class="ov-row-main">
-      <span class="ov-method m-${method.toLowerCase()}">${escHtml(method)}</span>
+      <span class="ov-method m-${safeMethodClass(method)}">${escHtml(method)}</span>
       <div class="ov-info">
         <div class="ov-url" title="${escHtml(req.url || '')}">${escHtml(shortUrl)}</div>
         <div class="ov-meta">
@@ -296,20 +409,38 @@ function rowHtml(req: ApiRequest): string {
 }
 
 function renderList(): void {
+  if (!activated) return;
   const list = $('ov-list');
   const countEl = $('ov-count');
   if (!list) return;
 
-  const filterText = (($('ov-filter') as HTMLInputElement)?.value || '').toLowerCase();
-  const filterMethod = ($('ov-method-filter') as HTMLSelectElement)?.value || '';
+  if (cspBlocked) {
+    list.innerHTML = `<div class="ov-empty" style="color:#ef5350">
+      Capture script failed to load.<br><small>Likely blocked by the page's Content-Security-Policy. Reload the page to retry.</small>
+    </div>`;
+    if (countEl) countEl.textContent = '0';
+    return;
+  }
 
-  let items = [...requests.values()].reverse();
-  if (filterText) items = items.filter(r => r.url?.toLowerCase().includes(filterText));
-  if (filterMethod) items = items.filter(r => r.method === filterMethod);
+  const filterText = (filterInput?.value || '').toLowerCase();
+  const filterMethod = methodFilterSelect?.value || '';
+
+  // Walk insertion order once into a snapshot, then iterate that snapshot
+  // backward (newest first) collecting matches until we hit RENDER_LIMIT.
+  // Avoids the second pass that .reverse() + .filter() would do, and stops
+  // early when the filter is narrow enough.
+  const snapshot = Array.from(requests.values());
+  const visible: ApiRequest[] = [];
+  for (let i = snapshot.length - 1; i >= 0 && visible.length < RENDER_LIMIT; i--) {
+    const r = snapshot[i];
+    if (filterText && !r.url?.toLowerCase().includes(filterText)) continue;
+    if (filterMethod && r.method !== filterMethod) continue;
+    visible.push(r);
+  }
 
   if (countEl) countEl.textContent = String(requests.size);
 
-  if (items.length === 0) {
+  if (visible.length === 0) {
     list.innerHTML = `<div class="ov-empty">${
       requests.size === 0
         ? 'No API calls captured yet.<br><small>Interact with the page to see calls appear here.</small>'
@@ -317,8 +448,6 @@ function renderList(): void {
     }</div>`;
     return;
   }
-
-  const visible = items.slice(0, 200);
 
   if (groupByDomain) {
     const groups = new Map<string, ApiRequest[]>();
@@ -350,38 +479,57 @@ function renderList(): void {
   } else {
     list.innerHTML = visible.map(rowHtml).join('');
   }
-
-  attachRowEvents(list);
 }
 
-function attachRowEvents(list: HTMLElement): void {
-  list.querySelectorAll<HTMLElement>('.ov-row').forEach(row => {
-    row.addEventListener('mouseenter', () => {
-      const sel = decodeURIComponent(row.dataset.sel || '');
-      if (sel) highlightEl(sel);
-    });
-    row.addEventListener('mouseleave', clearHighlight);
+let rowEventsBound = false;
 
-    const main = row.querySelector('.ov-row-main');
-    if (main) {
-      main.addEventListener('click', (e: Event) => {
-        if ((e.target as Element).closest('.ov-copy-btn')) return;
-        const id = Number(row.dataset.id);
-        if (expandedIds.has(id)) expandedIds.delete(id);
-        else expandedIds.add(id);
-        renderList();
-      });
-    }
+function bindListDelegation(list: HTMLElement): void {
+  if (rowEventsBound) return;
+  rowEventsBound = true;
+
+  list.addEventListener('mouseover', (e: Event) => {
+    const row = (e.target as Element).closest<HTMLElement>('.ov-row');
+    if (!row || !list.contains(row)) return;
+    const related = (e as MouseEvent).relatedTarget as Element | null;
+    if (related && row.contains(related)) return;
+    const sel = decodeURIComponent(row.dataset.sel || '');
+    if (sel) highlightEl(sel);
   });
 
-  list.querySelectorAll<HTMLElement>('.ov-copy-btn').forEach(btn => {
-    btn.addEventListener('click', (e: Event) => {
+  list.addEventListener('mouseout', (e: Event) => {
+    const row = (e.target as Element).closest<HTMLElement>('.ov-row');
+    if (!row) return;
+    const related = (e as MouseEvent).relatedTarget as Element | null;
+    if (related && row.contains(related)) return;
+    clearHighlight();
+  });
+
+  list.addEventListener('click', (e: Event) => {
+    const target = e.target as Element;
+    const copyBtn = target.closest<HTMLElement>('.ov-copy-btn');
+    if (copyBtn) {
       e.stopPropagation();
-      const url = decodeURIComponent(btn.dataset.url || '');
-      navigator.clipboard?.writeText(url).catch(() => {});
-      btn.textContent = 'copied';
-      setTimeout(() => { btn.textContent = 'copy'; }, 700);
-    });
+      const url = decodeURIComponent(copyBtn.dataset.url || '');
+      const restore = (label: string) => {
+        copyBtn.textContent = label;
+        setTimeout(() => { copyBtn.textContent = 'copy'; }, 900);
+      };
+      if (navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(url).then(
+          () => restore('copied'),
+          () => restore('failed')
+        );
+      } else {
+        restore('failed');
+      }
+      return;
+    }
+    const row = target.closest<HTMLElement>('.ov-row');
+    if (!row) return;
+    const id = Number(row.dataset.id);
+    if (expandedIds.has(id)) expandedIds.delete(id);
+    else expandedIds.add(id);
+    scheduleRender();
   });
 }
 
@@ -399,6 +547,9 @@ function exportHAR(): void {
     return 'text/plain';
   }
 
+  const encoder = new TextEncoder();
+  const byteLen = (s: string | null | undefined): number => s ? encoder.encode(s).length : -1;
+
   const entries = [...requests.values()]
     .filter(r => r.kind !== 'ws' && typeof r.status === 'number')
     .map(r => ({
@@ -412,7 +563,7 @@ function exportHAR(): void {
         queryString: parseQuery(r.url),
         cookies: [],
         headersSize: -1,
-        bodySize: r.reqBody ? r.reqBody.length : -1,
+        bodySize: byteLen(r.reqBody),
         ...(r.reqBody ? { postData: { mimeType: detectMime(r.reqBody), text: r.reqBody } } : {})
       },
       response: {
@@ -422,13 +573,13 @@ function exportHAR(): void {
         headers: [],
         cookies: [],
         content: {
-          size: r.resBody ? r.resBody.length : -1,
+          size: byteLen(r.resBody),
           mimeType: detectMime(r.resBody),
           text: r.resBody || ''
         },
         redirectURL: '',
         headersSize: -1,
-        bodySize: r.resBody ? r.resBody.length : -1
+        bodySize: byteLen(r.resBody)
       },
       cache: {},
       timings: { send: 0, wait: r.ms || 0, receive: 0 }
@@ -443,7 +594,8 @@ function exportHAR(): void {
     }
   };
 
-  const blob = new Blob([JSON.stringify(har, null, 2)], { type: 'application/json' });
+  // Compact serialization — pretty-printing tens of MB blocks the main thread.
+  const blob = new Blob([JSON.stringify(har)], { type: 'application/json' });
   const blobUrl = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = blobUrl;
@@ -461,7 +613,9 @@ function highlightEl(selector: string): void {
     if (!el || el.closest('#ov-panel')) return;
     el.classList.add('ov-highlighted');
     activeHighlight = el;
-    el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    const rect = el.getBoundingClientRect();
+    const fullyVisible = rect.top >= 0 && rect.bottom <= window.innerHeight;
+    if (!fullyVisible) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   } catch { /* invalid selector */ }
 }
 
@@ -483,11 +637,14 @@ function flashBadge(req: ApiRequest): void {
     if (!rect.width && !rect.height) return;
 
     const key = req.id;
-    if (badges.has(key)) badges.get(key)!.remove();
+    const existing = badges.get(key);
+    if (existing) existing.remove();
+    const prevTimer = badgeTimers.get(key);
+    if (prevTimer !== undefined) clearTimeout(prevTimer);
 
     const badge = document.createElement('div');
     badge.className = 'ov-float-badge';
-    badge.dataset.method = req.method?.toLowerCase();
+    badge.dataset.method = safeMethodClass(req.method);
 
     let label = req.url;
     try { label = new URL(req.url).pathname; } catch { /* use full url */ }
@@ -497,14 +654,25 @@ function flashBadge(req: ApiRequest): void {
     document.documentElement.appendChild(badge);
     badges.set(key, badge);
 
-    setTimeout(() => { badge.remove(); badges.delete(key); }, 5000);
+    const timer = window.setTimeout(() => {
+      badge.remove();
+      badges.delete(key);
+      badgeTimers.delete(key);
+    }, 5000);
+    badgeTimers.set(key, timer);
   } catch { /* invalid selector */ }
 }
 
 function clearAllBadges(): void {
   for (const b of badges.values()) b.remove();
+  for (const t of badgeTimers.values()) clearTimeout(t);
   badges.clear();
+  badgeTimers.clear();
   for (const b of document.querySelectorAll('.ov-float-badge')) b.remove();
+}
+
+function signalInjected(action: 'pause' | 'resume' | 'stop' | 'start'): void {
+  window.postMessage({ __apiOverlayControl: true, action }, '*');
 }
 
 function makeDraggable(panel: HTMLElement, handle: HTMLElement): void {
@@ -940,12 +1108,30 @@ function injectStyles(): void {
   document.documentElement.appendChild(s);
 }
 
+let injectedLoaded = false;
+
 function activateOverlay(): void {
   if (activated) return;
   activated = true;
-  const script = document.createElement('script');
-  script.src = chrome.runtime.getURL('dist/injected.js');
-  (document.head || document.documentElement).prepend(script);
+  cspBlocked = false;
+  if (!injectedLoaded) {
+    const script = document.createElement('script');
+    script.src = chrome.runtime.getURL('dist/injected.js');
+    script.onload = () => {
+      injectedLoaded = true;
+      script.remove();
+    };
+    script.onerror = () => {
+      // Page CSP refused chrome-extension: scripts; surface a clear notice.
+      script.remove();
+      cspBlocked = true;
+      renderList();
+    };
+    (document.head || document.documentElement).prepend(script);
+  } else {
+    // Injected script already loaded from a previous activation — wake it up.
+    signalInjected('start');
+  }
   if (document.body) {
     loadTheme().then(theme => { currentTheme = theme; buildPanel(); });
   } else {
@@ -958,15 +1144,39 @@ function activateOverlay(): void {
 function deactivateOverlay(): void {
   if (!activated) return;
   activated = false;
+  rowEventsBound = false;
+  signalInjected('stop');
+  cancelScheduledRender();
   document.getElementById('ov-panel')?.remove();
   document.getElementById('ov-styles')?.remove();
+  filterInput = null;
+  methodFilterSelect = null;
   clearAllBadges();
   requests.clear();
   expandedIds.clear();
+  // Reset UI state so a fresh re-activation isn't silently paused / hidden.
+  paused = false;
+  panelVisible = true;
+  cspBlocked = false;
+}
+
+// "example.com" matches example.com and any subdomain (api.example.com, www.example.com),
+// but "www.example.com" does not match example.com — narrower entries stay narrow.
+function hostAllowed(allowedHosts: string[], current: string): boolean {
+  if (!current) return false;
+  return allowedHosts.some(h => h === current || current.endsWith('.' + h));
 }
 
 chrome.storage.local.get('ovAllowedHosts', ({ ovAllowedHosts }) => {
-  if ((ovAllowedHosts as string[] ?? []).includes(location.hostname)) {
+  if (hostAllowed((ovAllowedHosts as string[]) ?? [], location.hostname)) {
     activateOverlay();
   }
+});
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || !changes.ovAllowedHosts) return;
+  const next = (changes.ovAllowedHosts.newValue as string[] | undefined) ?? [];
+  const shouldBeActive = hostAllowed(next, location.hostname);
+  if (shouldBeActive && !activated) activateOverlay();
+  else if (!shouldBeActive && activated) deactivateOverlay();
 });
