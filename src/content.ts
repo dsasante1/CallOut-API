@@ -84,6 +84,9 @@ let valueHighlightIndex = 0;
 // Key shape: `${rowId}|${kind}|${encodedRawValue}` — reattached on rerender.
 let valueHighlightKey = '';
 
+let bulkHighlightEls: HTMLElement[] = [];
+let bulkHighlightRowId = -1;
+
 function scheduleRender(): void {
   if (renderScheduled) return;
   renderScheduled = true;
@@ -218,6 +221,7 @@ chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, 
       detailTabs.clear();
       clearAllBadges();
       clearValueHighlights();
+      clearBulkHighlights();
       renderList();
       sendResponse({ ok: true });
       break;
@@ -336,7 +340,7 @@ function buildPanel(): void {
     panelVisible = false;
     chrome.storage.local.set({ ovVisible: false });
   };
-  $('ov-clear')!.onclick = () => { requests.clear(); expandedIds.clear(); detailTabs.clear(); clearAllBadges(); clearValueHighlights(); renderList(); };
+  $('ov-clear')!.onclick = () => { requests.clear(); expandedIds.clear(); detailTabs.clear(); clearAllBadges(); clearValueHighlights(); clearBulkHighlights(); renderList(); };
   $('ov-pause')!.onclick = () => setPaused(!paused);
   $('ov-theme')!.onclick = () => {
     const next: 'dark' | 'light' = currentTheme === 'dark' ? 'light' : 'dark';
@@ -410,6 +414,27 @@ function tryParseJsonContainer(text: string | null | undefined): unknown | undef
   const t = text.trimStart();
   if (!t.startsWith('{') && !t.startsWith('[')) return undefined;
   try { return JSON.parse(text); } catch { return undefined; }
+}
+
+function collectJsonLeaves(root: unknown, out: Array<{value: string, kind: string}>): void {
+  const seen = new Set<string>();
+  function walk(value: unknown): void {
+    if (value === null || typeof value === 'boolean') return;
+    const t = typeof value;
+    if (t === 'string') {
+      const s = (value as string).trim();
+      if (s.length >= 6 && !seen.has(s)) { seen.add(s); out.push({ value: s, kind: 'string' }); }
+      return;
+    }
+    if (t === 'number') {
+      const s = String(value);
+      if (!seen.has(s)) { seen.add(s); out.push({ value: s, kind: 'number' }); }
+      return;
+    }
+    if (Array.isArray(value)) { for (const item of value) walk(item); return; }
+    if (t === 'object') { for (const v of Object.values(value as Record<string, unknown>)) walk(v); }
+  }
+  walk(root);
 }
 
 interface JsonRenderState { chars: number; truncated: boolean }
@@ -489,6 +514,55 @@ function normalizeNumber(s: string): string {
   if (!m) return '';
   const n = Number(m[0]);
   return Number.isFinite(n) ? String(n) : '';
+}
+
+function findMultipleValuesInDom(queries: Array<{value: string, kind: string}>): HTMLElement[] {
+  if (queries.length === 0) return [];
+  const termSeen = new Set<string>();
+  const terms: Array<{lower: string, value: string, kind: string, numNorm: string}> = [];
+  for (const q of queries) {
+    const key = `${q.kind}:${q.value}`;
+    if (termSeen.has(key)) continue;
+    termSeen.add(key);
+    terms.push({ lower: q.value.toLowerCase(), value: q.value, kind: q.kind, numNorm: q.kind === 'number' ? normalizeNumber(q.value) : '' });
+  }
+  if (terms.length === 0) return [];
+
+  const results: HTMLElement[] = [];
+  const seenEls = new Set<HTMLElement>();
+  const ownedByOverlay = (el: Element | null): boolean =>
+    !!el && (!!el.closest('#ov-panel') || el.classList.contains('ov-float-badge'));
+
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parent = node.parentElement;
+      if (!parent || ownedByOverlay(parent)) return NodeFilter.FILTER_REJECT;
+      const tag = parent.tagName;
+      if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+
+  for (let node = walker.nextNode(); node && results.length < MAX_VALUE_HIGHLIGHTS; node = walker.nextNode()) {
+    const text = (node.nodeValue || '').trim();
+    if (!text) continue;
+    const textLower = text.toLowerCase();
+    for (const term of terms) {
+      let hit = false;
+      if (term.kind === 'number') {
+        if (term.numNorm && normalizeNumber(text) === term.numNorm) hit = true;
+      } else {
+        if (text === term.value || textLower === term.lower) hit = true;
+        else if (term.value.length >= MIN_SUBSTRING_LEN && textLower.includes(term.lower)) hit = true;
+      }
+      if (hit) {
+        const parent = (node as Text).parentElement;
+        if (parent && !seenEls.has(parent)) { seenEls.add(parent); results.push(parent); }
+        break;
+      }
+    }
+  }
+  return results;
 }
 
 // Walk the host DOM for matches of `value`. Skips overlay-owned nodes. Caps
@@ -586,6 +660,26 @@ function clearValueHighlights(): void {
   document.getElementById('ov-value-status')?.remove();
 }
 
+function clearBulkHighlights(): void {
+  for (const el of bulkHighlightEls) el.classList.remove('ov-value-match');
+  bulkHighlightEls = [];
+  bulkHighlightRowId = -1;
+}
+
+function runBulkHighlight(rowId: number): void {
+  clearBulkHighlights();
+  const req = requests.get(rowId);
+  if (!req?.resBody) return;
+  const parsed = tryParseJsonContainer(req.resBody);
+  if (parsed === undefined) return;
+  const leaves: Array<{value: string, kind: string}> = [];
+  collectJsonLeaves(parsed, leaves);
+  const matches = findMultipleValuesInDom(leaves);
+  bulkHighlightEls = matches;
+  bulkHighlightRowId = rowId;
+  for (const el of matches) el.classList.add('ov-value-match');
+}
+
 function setValueStatusBadge(jv: HTMLElement, total: number, index: number): void {
   let el = document.getElementById('ov-value-status');
   if (!el) {
@@ -601,6 +695,7 @@ function setValueStatusBadge(jv: HTMLElement, total: number, index: number): voi
 }
 
 function handleJsonValueClick(jv: HTMLElement): void {
+  clearBulkHighlights();
   const row = jv.closest<HTMLElement>('.ov-row');
   const rowId = row?.dataset.id || '';
   const encVal = jv.dataset.ovVal || '';
@@ -644,6 +739,7 @@ function reattachValueHighlight(): void {
   span.classList.add('ov-jv-active');
   setValueStatusBadge(span, valueHighlightEls.length, valueHighlightIndex);
 }
+
 
 function getHostname(url: string): string {
   try { return new URL(url).hostname; } catch { return 'unknown'; }
@@ -940,6 +1036,8 @@ function bindListDelegation(list: HTMLElement): void {
       const tab = tabBtn.dataset.tab as DetailTab | undefined;
       if (!Number.isFinite(id) || !tab) return;
       detailTabs.set(id, tab);
+      clearBulkHighlights();
+      if (tab === 'body') runBulkHighlight(id);
       scheduleRender();
       return;
     }
@@ -956,8 +1054,11 @@ function bindListDelegation(list: HTMLElement): void {
       expandedIds.delete(id);
       detailTabs.delete(id);
       if (valueHighlightKey.startsWith(`${id}|`)) clearValueHighlights();
+      if (bulkHighlightRowId === id) clearBulkHighlights();
     } else {
       expandedIds.add(id);
+      const activeTab = detailTabs.get(id) || 'body';
+      if (activeTab === 'body') runBulkHighlight(id);
     }
     scheduleRender();
   });
@@ -1801,6 +1902,7 @@ function deactivateOverlay(): void {
   statusFilterSelect = null;
   clearAllBadges();
   clearValueHighlights();
+  clearBulkHighlights();
   requests.clear();
   expandedIds.clear();
   detailTabs.clear();
