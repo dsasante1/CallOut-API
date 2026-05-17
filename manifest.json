@@ -25,7 +25,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["dist/injected.js"],
+      "resources": ["dist/injected.js", "fonts/*.woff2"],
       "matches": ["<all_urls>"]
     }
   ]
