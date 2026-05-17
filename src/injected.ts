@@ -39,6 +39,40 @@ interface XMLHttpRequest {
     'authorization', 'proxy-authorization', 'cookie', 'set-cookie',
     'x-api-key', 'x-auth-token', 'x-csrf-token'
   ]);
+  // JSON body keys whose values are scrubbed for the same reason. Header redaction
+  // would leak otherwise — e.g. a login response body that contains the same token.
+  const REDACTED_BODY_KEYS = new Set([
+    'password', 'passwd', 'pwd', 'new_password', 'old_password', 'current_password',
+    'secret', 'client_secret', 'private_key', 'privatekey',
+    'token', 'access_token', 'refresh_token', 'id_token', 'auth_token', 'authtoken',
+    'api_key', 'apikey', 'authorization',
+    'jwt', 'session', 'sessionid', 'session_id'
+  ]);
+
+  function redactJsonNode(v: unknown): unknown {
+    if (Array.isArray(v)) return v.map(redactJsonNode);
+    if (v && typeof v === 'object') {
+      const out: Record<string, unknown> = {};
+      for (const [k, val] of Object.entries(v as Record<string, unknown>)) {
+        out[k] = REDACTED_BODY_KEYS.has(k.toLowerCase()) ? '[redacted]' : redactJsonNode(val);
+      }
+      return out;
+    }
+    return v;
+  }
+
+  function redactBody(text: string | null): string | null {
+    if (!text) return text;
+    const t = text.trimStart();
+    if (!t.startsWith('{') && !t.startsWith('[')) return text;
+    try {
+      const parsed = JSON.parse(text);
+      const redacted = redactJsonNode(parsed);
+      return JSON.stringify(redacted);
+    } catch {
+      return text;
+    }
+  }
 
   window.addEventListener('message', (e: MessageEvent) => {
     if (e.source !== window) return;
@@ -253,7 +287,7 @@ interface XMLHttpRequest {
       url = String(args[0]);
       const init = args[1] as RequestInit | undefined;
       method = (init?.method || 'GET').toUpperCase();
-      reqBody = extractBody(init?.body);
+      reqBody = redactBody(extractBody(init?.body));
       reqHeaders = serializeHeaders(init?.headers);
     }
     const el = getInteractedElement();
@@ -268,7 +302,7 @@ interface XMLHttpRequest {
         emit({ id, url, method, kind: 'fetch', status: res.status, ms, element: elementInfo(el), ts: t0, reqBody, reqHeaders, resHeaders });
         if (isTextLikeResponse(res)) {
           readBodyStreaming(res.clone(), MAX_BODY_BYTES).then(text => {
-            emit({ id, resBody: text });
+            emit({ id, resBody: redactBody(text) });
           }).catch(() => {});
         }
         return res;
@@ -312,7 +346,7 @@ interface XMLHttpRequest {
     const id = ++requestId;
     const method = this.__ov_method || 'GET';
     const url = this.__ov_url || '';
-    const reqBody = extractBody(args[0] as BodyInit | Document | null);
+    const reqBody = redactBody(extractBody(args[0] as BodyInit | Document | null));
     const reqHeaders = this.__ov_req_headers ? this.__ov_req_headers.slice() : null;
     const el = getInteractedElement();
     const t0 = Date.now();
@@ -330,7 +364,7 @@ interface XMLHttpRequest {
       if (!tooBig && (xhr.responseType === '' || xhr.responseType === 'text')) {
         const ct = xhr.getResponseHeader('content-type') || '';
         if (!ct || TEXTLIKE_CT.test(ct)) {
-          resBody = xhr.responseText?.slice(0, MAX_BODY_BYTES) ?? null;
+          resBody = redactBody(xhr.responseText?.slice(0, MAX_BODY_BYTES) ?? null);
         }
       }
       const resHeaders = parseRawHeaders(xhr.getAllResponseHeaders());
@@ -360,19 +394,25 @@ interface XMLHttpRequest {
 
       emit({ id, url: wsUrl, method: 'WS', kind: 'ws', status: 'pending', element: elementInfo(el), ts: t0 });
 
+      // Once-per-connection lifecycle: finalize even while paused (matches fetch/XHR), bail only when stopped.
       this.addEventListener('open', () => {
+        if (stopped) return;
         emit({ id, url: wsUrl, method: 'WS', kind: 'ws', status: 101, ms: Date.now() - t0, element: elementInfo(el), ts: t0 });
       });
 
       this.addEventListener('close', (e: CloseEvent) => {
+        if (stopped) return;
         emit({ id, url: wsUrl, method: 'WS', kind: 'ws', status: e.wasClean ? 'closed' : 'error', ms: Date.now() - t0, element: elementInfo(el), ts: t0 });
       });
 
       this.addEventListener('error', () => {
+        if (stopped) return;
         emit({ id, url: wsUrl, method: 'WS', kind: 'ws', status: 'error', ms: Date.now() - t0, element: elementInfo(el), ts: t0 });
       });
 
+      // Ongoing frame stream: pause must actually pause, not just hide.
       this.addEventListener('message', (e: MessageEvent) => {
+        if (stopped || !capturing) return;
         const body = typeof e.data === 'string' ? e.data.slice(0, MAX_WS_BODY_BYTES) : '[Binary]';
         emit({ __wsMsg: true, wsId: id, dir: 'recv', body, ts: Date.now() });
       });
@@ -380,8 +420,10 @@ interface XMLHttpRequest {
       type WSData = string | Blob | BufferSource;
       const origSend: (data: WSData) => void = _WebSocket.prototype.send.bind(this);
       this.send = (data: WSData): void => {
-        const body = typeof data === 'string' ? data.slice(0, MAX_WS_BODY_BYTES) : '[Binary]';
-        emit({ __wsMsg: true, wsId: id, dir: 'sent', body, ts: Date.now() });
+        if (!stopped && capturing) {
+          const body = typeof data === 'string' ? data.slice(0, MAX_WS_BODY_BYTES) : '[Binary]';
+          emit({ __wsMsg: true, wsId: id, dir: 'sent', body, ts: Date.now() });
+        }
         origSend(data);
       };
     }

@@ -241,7 +241,9 @@ btnClear.addEventListener('click',  () => send('clear'));
 
 btnEnable.addEventListener('click', async () => {
   if (!currentHostname) return;
-  if (!allowedHosts.includes(currentHostname)) {
+  // Don't add a redundant entry when an existing rule already covers this hostname
+  // (e.g. allowing example.com transitively allows sub.example.com).
+  if (!popupHostAllowed(allowedHosts, currentHostname)) {
     allowedHosts.push(currentHostname);
     await chrome.storage.local.set({ ovAllowedHosts: allowedHosts });
     renderHostList();
