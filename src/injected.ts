@@ -7,9 +7,11 @@ interface XMLHttpRequest {
   __ov_url?: string;
   __ov_load_listener?: (this: XMLHttpRequest) => void;
   __ov_error_listener?: (this: XMLHttpRequest) => void;
+  __ov_req_headers?: Array<[string, string]>;
 }
 
 (function () {
+  type HeaderPair = [string, string];
   if (window.__apiOverlayActive) return;
   window.__apiOverlayActive = true;
 
@@ -30,6 +32,13 @@ interface XMLHttpRequest {
   const MAX_WS_BODY_BYTES = 10_000;
   const MAX_INSPECTED_BODY = 1_000_000;
   const INTERACT_WINDOW_MS = 800;
+  const MAX_HEADERS = 100;
+  const MAX_HEADER_VALUE = 2_000;
+  // Headers whose values are scrubbed before emitting — overlay is screen-sharable.
+  const REDACTED_HEADERS = new Set([
+    'authorization', 'proxy-authorization', 'cookie', 'set-cookie',
+    'x-api-key', 'x-auth-token', 'x-csrf-token'
+  ]);
 
   window.addEventListener('message', (e: MessageEvent) => {
     if (e.source !== window) return;
@@ -119,6 +128,57 @@ interface XMLHttpRequest {
     window.postMessage({ __apiOverlay: true, ...data }, '*');
   }
 
+  function redactHeaderValue(name: string, value: string): string {
+    if (REDACTED_HEADERS.has(name.toLowerCase())) return '[redacted]';
+    return value.length > MAX_HEADER_VALUE ? value.slice(0, MAX_HEADER_VALUE) + '…' : value;
+  }
+
+  function pushHeader(out: HeaderPair[], name: string, value: unknown): void {
+    if (out.length >= MAX_HEADERS) return;
+    out.push([name, redactHeaderValue(name, String(value))]);
+  }
+
+  function serializeHeaders(input: HeadersInit | undefined | null): HeaderPair[] | null {
+    if (input == null) return null;
+    const out: HeaderPair[] = [];
+    try {
+      if (typeof Headers !== 'undefined' && input instanceof Headers) {
+        input.forEach((value, name) => { pushHeader(out, name, value); });
+      } else if (Array.isArray(input)) {
+        for (const entry of input) {
+          if (!entry || entry.length < 2) continue;
+          pushHeader(out, String(entry[0]), entry[1]);
+        }
+      } else if (typeof input === 'object') {
+        for (const [name, value] of Object.entries(input as Record<string, unknown>)) {
+          pushHeader(out, name, value);
+        }
+      }
+    } catch { /* ignore malformed headers */ }
+    return out.length ? out : null;
+  }
+
+  function headersFromObject(headers: Headers): HeaderPair[] | null {
+    const out: HeaderPair[] = [];
+    try { headers.forEach((value, name) => { pushHeader(out, name, value); }); }
+    catch { /* ignore */ }
+    return out.length ? out : null;
+  }
+
+  // Parse XHR's getAllResponseHeaders() output ("name: value\r\n" per line) into pairs.
+  function parseRawHeaders(raw: string | null): HeaderPair[] | null {
+    if (!raw) return null;
+    const out: HeaderPair[] = [];
+    for (const line of raw.split(/\r\n/)) {
+      const idx = line.indexOf(':');
+      if (idx < 0) continue;
+      const name = line.slice(0, idx).trim();
+      if (!name) continue;
+      pushHeader(out, name, line.slice(idx + 1).trim());
+    }
+    return out.length ? out : null;
+  }
+
   function extractBody(body: BodyInit | Document | null | undefined): string | null {
     if (body == null) return null;
     if (typeof body === 'string') return body.slice(0, MAX_BODY_BYTES);
@@ -182,24 +242,30 @@ interface XMLHttpRequest {
     let url: string;
     let method: string;
     let reqBody: string | null = null;
+    let reqHeaders: HeaderPair[] | null = null;
     if (args[0] instanceof Request) {
       url = args[0].url;
       method = args[0].method.toUpperCase();
+      reqHeaders = headersFromObject(args[0].headers);
+      const init = args[1] as RequestInit | undefined;
+      if (init?.headers) reqHeaders = serializeHeaders(init.headers) ?? reqHeaders;
     } else {
       url = String(args[0]);
       const init = args[1] as RequestInit | undefined;
       method = (init?.method || 'GET').toUpperCase();
       reqBody = extractBody(init?.body);
+      reqHeaders = serializeHeaders(init?.headers);
     }
     const el = getInteractedElement();
     const t0 = Date.now();
 
-    emit({ id, url, method, kind: 'fetch', status: 'pending', element: elementInfo(el), ts: t0, reqBody });
+    emit({ id, url, method, kind: 'fetch', status: 'pending', element: elementInfo(el), ts: t0, reqBody, reqHeaders });
 
     return _fetch.apply(this, args)
       .then(res => {
         const ms = Date.now() - t0;
-        emit({ id, url, method, kind: 'fetch', status: res.status, ms, element: elementInfo(el), ts: t0, reqBody });
+        const resHeaders = headersFromObject(res.headers);
+        emit({ id, url, method, kind: 'fetch', status: res.status, ms, element: elementInfo(el), ts: t0, reqBody, reqHeaders, resHeaders });
         if (isTextLikeResponse(res)) {
           readBodyStreaming(res.clone(), MAX_BODY_BYTES).then(text => {
             emit({ id, resBody: text });
@@ -208,19 +274,22 @@ interface XMLHttpRequest {
         return res;
       })
       .catch(err => {
-        emit({ id, url, method, kind: 'fetch', status: 'error', ms: Date.now() - t0, element: elementInfo(el), ts: t0, reqBody });
+        emit({ id, url, method, kind: 'fetch', status: 'error', ms: Date.now() - t0, element: elementInfo(el), ts: t0, reqBody, reqHeaders });
         throw err;
       });
   };
 
   const _open = XMLHttpRequest.prototype.open;
   const _send = XMLHttpRequest.prototype.send;
+  const _setRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
 
   // Cast to any to bypass overload signature mismatch — we forward all args as-is
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (XMLHttpRequest.prototype as any).open = function (method: string, url: string | URL, ...rest: unknown[]): void {
     this.__ov_method = method.toUpperCase();
     this.__ov_url = String(url);
+    // Per spec, open() resets the request header list — clear our shadow copy too.
+    this.__ov_req_headers = undefined;
     if (this.__ov_load_listener) {
       this.removeEventListener('load', this.__ov_load_listener);
       this.__ov_load_listener = undefined;
@@ -232,16 +301,23 @@ interface XMLHttpRequest {
     (_open as (...a: unknown[]) => void).apply(this, [method, url, ...rest]);
   };
 
+  XMLHttpRequest.prototype.setRequestHeader = function (name: string, value: string): void {
+    if (!this.__ov_req_headers) this.__ov_req_headers = [];
+    pushHeader(this.__ov_req_headers, name, value);
+    _setRequestHeader.call(this, name, value);
+  };
+
   XMLHttpRequest.prototype.send = function (...args: Parameters<typeof XMLHttpRequest.prototype.send>): void {
     if (stopped || !capturing) { _send.apply(this, args); return; }
     const id = ++requestId;
     const method = this.__ov_method || 'GET';
     const url = this.__ov_url || '';
     const reqBody = extractBody(args[0] as BodyInit | Document | null);
+    const reqHeaders = this.__ov_req_headers ? this.__ov_req_headers.slice() : null;
     const el = getInteractedElement();
     const t0 = Date.now();
 
-    emit({ id, url, method, kind: 'xhr', status: 'pending', element: elementInfo(el), ts: t0, reqBody });
+    emit({ id, url, method, kind: 'xhr', status: 'pending', element: elementInfo(el), ts: t0, reqBody, reqHeaders });
 
     if (this.__ov_load_listener) this.removeEventListener('load', this.__ov_load_listener);
     if (this.__ov_error_listener) this.removeEventListener('error', this.__ov_error_listener);
@@ -257,10 +333,11 @@ interface XMLHttpRequest {
           resBody = xhr.responseText?.slice(0, MAX_BODY_BYTES) ?? null;
         }
       }
-      emit({ id, url, method, kind: 'xhr', status: xhr.status, ms: Date.now() - t0, element: elementInfo(el), ts: t0, reqBody, resBody });
+      const resHeaders = parseRawHeaders(xhr.getAllResponseHeaders());
+      emit({ id, url, method, kind: 'xhr', status: xhr.status, ms: Date.now() - t0, element: elementInfo(el), ts: t0, reqBody, resBody, reqHeaders, resHeaders });
     };
     const onError = function (this: XMLHttpRequest): void {
-      emit({ id, url, method, kind: 'xhr', status: 'error', ms: Date.now() - t0, element: elementInfo(el), ts: t0, reqBody });
+      emit({ id, url, method, kind: 'xhr', status: 'error', ms: Date.now() - t0, element: elementInfo(el), ts: t0, reqBody, reqHeaders });
     };
     this.__ov_load_listener = onLoad;
     this.__ov_error_listener = onError;
