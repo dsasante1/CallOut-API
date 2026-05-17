@@ -3,194 +3,349 @@
 <head>
 <meta charset="utf-8"/>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    width: 260px;
-    background: #12121f;
-    color: #dde1f0;
-    font-family: 'SF Mono', 'Fira Code', monospace;
-    font-size: 13px;
-    padding: 16px 18px;
-    transition: background .2s, color .2s;
-  }
-  h2 {
-    font-size: 14px;
-    color: #c8cfff;
-    margin-bottom: 14px;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-  .dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: #66bb6a;
-    display: inline-block;
-    flex-shrink: 0;
-  }
-  .dot.off { background: #555; }
-  button {
-    all: unset;
-    display: block;
-    width: 100%;
-    background: #1e1e38;
-    color: #9fa8da;
-    border: 1px solid #2e2e52;
-    padding: 10px 14px;
-    border-radius: 7px;
-    cursor: pointer;
-    font-family: inherit;
-    font-size: 12px;
-    margin-bottom: 8px;
-    text-align: center;
-    transition: background .15s, color .15s, border-color .15s;
-    box-sizing: border-box;
-  }
-  button:hover { background: #2e2e52; color: #fff; }
-  button.danger:hover { background: #3a1a1a; color: #ef5350; }
-  #btn-theme {
-    border-style: dashed;
-    color: #7986cb;
-  }
-  #btn-theme:hover { background: #2a2a6a; color: #c5cae9; border-style: solid; }
-  .hint {
-    font-size: 10px;
-    color: #444;
-    margin-top: 8px;
-    line-height: 1.6;
-  }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  width: 320px;
+  font-family: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
+  font-size: 11px;
+  --bg:        #0d0e10;
+  --bg-2:      #14161a;
+  --bg-3:      #1a1d22;
+  --border:    #2a2f37;
+  --fg:        #d6dae0;
+  --fg-2:      #9aa1ab;
+  --fg-3:      #6a7180;
+  --fg-mute:   #4a505c;
+  --accent:    #6ab0ff;
+  --accent-bg: rgba(106,176,255,0.14);
+  --s-ok:      #4ec9b0;
+  --s-err:     #ff5a6e;
+  background: var(--bg);
+  color: var(--fg);
+}
+body[data-theme="light"] {
+  --bg:        #fbfaf7;
+  --bg-2:      #ffffff;
+  --bg-3:      #f3f1ec;
+  --border:    #d9d4c4;
+  --fg:        #1a1c20;
+  --fg-2:      #4a4f59;
+  --fg-3:      #6c727c;
+  --fg-mute:   #9a9fa8;
+  --accent:    #2a6fdb;
+  --accent-bg: rgba(42,111,219,0.12);
+  --s-ok:      #1a8473;
+  --s-err:     #c0273f;
+}
 
-  /* ── light theme ── */
-  body[data-theme="light"] { background: #f5f5fb; color: #1a1a2e; }
-  body[data-theme="light"] h2 { color: #3a3a7a; }
-  body[data-theme="light"] button {
-    background: #e0e0f0;
-    color: #4a4a7a;
-    border-color: #c0c0e0;
-  }
-  body[data-theme="light"] button:hover { background: #c8c8e8; color: #1a1a2e; }
-  body[data-theme="light"] button.danger:hover { background: #fce8e8; color: #c62828; }
-  body[data-theme="light"] #btn-theme { color: #5c6bc0; }
-  body[data-theme="light"] #btn-theme:hover { background: #ddddf0; color: #3a3a7a; }
-  body[data-theme="light"] .dot.off { background: #bbb; }
-  body[data-theme="light"] .hint { color: #999; }
+/* ── Header ── */
+.phead {
+  display: flex; align-items: center; gap: 10px;
+  padding: 12px 14px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+}
+.phead .mark {
+  width: 22px; height: 22px;
+  background: var(--accent);
+  border-radius: 2px;
+  display: flex; align-items: center; justify-content: center;
+  color: var(--bg);
+  font-weight: 700; font-size: 11px;
+  flex-shrink: 0;
+}
+.phead .title {
+  font-weight: 700; font-size: 11px;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  flex: 1;
+}
+.phead .ver { font-size: 9px; color: var(--fg-mute); }
 
-  .divider {
-    border: none;
-    border-top: 1px solid #2a2a45;
-    margin: 12px 0;
-  }
-  .section-label {
-    font-size: 10px;
-    color: #555;
-    letter-spacing: .08em;
-    text-transform: uppercase;
-    margin-bottom: 8px;
-  }
-  #host-add-row {
-    display: flex;
-    gap: 6px;
-    margin-bottom: 8px;
-  }
-  #host-input {
-    all: unset;
-    flex: 1;
-    background: #1a1a30;
-    border: 1px solid #2e2e52;
-    color: #dde1f0;
-    padding: 6px 9px;
-    border-radius: 6px;
-    font-family: inherit;
-    font-size: 11px;
-    box-sizing: border-box;
-    min-width: 0;
-  }
-  #host-input::placeholder { color: #444; }
-  #btn-add-host {
-    width: auto;
-    padding: 6px 12px;
-    margin-bottom: 0;
-    font-size: 11px;
-    flex-shrink: 0;
-  }
-  #host-list {
-    max-height: 110px;
-    overflow-y: auto;
-    margin-bottom: 10px;
-  }
-  #host-list::-webkit-scrollbar { width: 3px; }
-  #host-list::-webkit-scrollbar-thumb { background: #2e2e52; border-radius: 3px; }
-  .host-item {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 5px 8px;
-    margin-bottom: 4px;
-    background: #1e1e38;
-    border-radius: 6px;
-    font-size: 11px;
-    color: #9fa8da;
-  }
-  .host-name {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    flex: 1;
-  }
-  .host-remove {
-    all: unset;
-    color: #555;
-    cursor: pointer;
-    padding: 0 4px;
-    font-size: 15px;
-    line-height: 1;
-    flex-shrink: 0;
-    margin-left: 6px;
-  }
-  .host-remove:hover { color: #ef5350; }
-  .host-empty {
-    font-size: 10px;
-    color: #444;
-    text-align: center;
-    padding: 8px 0;
-    font-style: italic;
-  }
-  #controls-section.disabled button:not(#btn-theme) {
-    opacity: 0.38;
-    pointer-events: none;
-  }
+/* ── Sections ── */
+.section {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.sec-head {
+  display: flex; align-items: center; justify-content: space-between;
+  font-size: 9px; color: var(--fg-3);
+  letter-spacing: 0.08em; text-transform: uppercase;
+  margin-bottom: 10px;
+}
+.badge {
+  font-size: 9px;
+  padding: 1px 5px;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  color: var(--fg-2);
+  letter-spacing: 0.04em;
+  text-transform: none;
+  white-space: nowrap;
+}
+.badge.on {
+  color: var(--s-ok);
+  border-color: var(--s-ok);
+  background: rgba(78,201,176,0.08);
+}
+.badge.off { color: var(--fg-mute); }
 
-  body[data-theme="light"] .divider { border-top-color: #d0d0e8; }
-  body[data-theme="light"] .section-label { color: #aaa; }
-  body[data-theme="light"] #host-input {
-    background: #f0f0fa;
-    border-color: #c0c0e0;
-    color: #1a1a2e;
-  }
-  body[data-theme="light"] #host-input::placeholder { color: #bbb; }
-  body[data-theme="light"] .host-item { background: #e8e8f5; color: #4a4a7a; }
-  body[data-theme="light"] .host-remove { color: #bbb; }
-  body[data-theme="light"] .host-remove:hover { color: #c62828; }
+/* ── Status line ── */
+.status-line {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  margin-bottom: 8px;
+}
+.status-line .sd {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--s-ok);
+  flex-shrink: 0;
+}
+.status-line.off .sd { background: var(--fg-mute); }
+.status-line .host {
+  flex: 1; color: var(--fg);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.status-line .state {
+  font-size: 9px; text-transform: uppercase;
+  letter-spacing: 0.08em; color: var(--accent);
+  white-space: nowrap;
+}
+.status-line.off .state { color: var(--fg-mute); }
+
+/* ── Buttons ── */
+.row { display: flex; gap: 6px; margin-bottom: 6px; }
+.row:last-child { margin-bottom: 0; }
+.btn {
+  flex: 1;
+  background: var(--bg-2);
+  color: var(--fg-2);
+  border: 1px solid var(--border);
+  padding: 7px 10px;
+  border-radius: 2px;
+  font-family: inherit; font-size: 11px;
+  text-align: center;
+  display: flex; align-items: center; justify-content: center; gap: 5px;
+  cursor: pointer;
+  transition: opacity 0.12s;
+}
+.btn.primary {
+  background: var(--accent-bg);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.btn.dim { color: var(--fg-mute); }
+.btn:hover { opacity: 0.8; }
+
+/* ── Host input ── */
+.input-row { display: flex; gap: 6px; margin-bottom: 8px; }
+.host-input {
+  flex: 1; min-width: 0;
+  background: var(--bg-2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  padding: 7px 10px;
+  border-radius: 2px;
+  font-family: inherit; font-size: 11px;
+  outline: none;
+}
+.host-input::placeholder { color: var(--fg-mute); }
+.host-input:focus { border-color: var(--accent); }
+.add-btn {
+  background: var(--accent-bg);
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  padding: 7px 12px;
+  border-radius: 2px;
+  font-family: inherit; font-size: 11px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+/* ── Host list ── */
+.host-list { display: flex; flex-direction: column; gap: 4px; }
+.host-item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 10px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  font-size: 11px;
+}
+.host-item.current {
+  border-color: var(--accent);
+  background: var(--accent-bg);
+}
+.host-item .host-name {
+  flex: 1; color: var(--fg);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.host-item .host-meta {
+  font-size: 9px; color: var(--fg-3);
+  text-transform: uppercase; letter-spacing: 0.06em; white-space: nowrap;
+}
+.host-item .host-now {
+  font-size: 9px; color: var(--accent); white-space: nowrap;
+}
+.host-item .host-remove {
+  background: transparent; border: none;
+  color: var(--fg-mute);
+  font-family: inherit; font-size: 15px; line-height: 1;
+  cursor: pointer; padding: 0 2px;
+}
+.host-item .host-remove:hover { color: var(--s-err); }
+.host-empty {
+  padding: 12px 10px;
+  text-align: center;
+  color: var(--fg-mute);
+  font-size: 10px; font-style: italic;
+  border: 1px dashed var(--border);
+  border-radius: 2px;
+}
+
+/* ── Footer ── */
+.pfooter {
+  padding: 8px 14px;
+  background: var(--bg-2);
+  font-size: 9px; color: var(--fg-3);
+  display: flex; gap: 8px; align-items: center;
+  border-top: 1px solid var(--border);
+}
+.pfooter a {
+  color: var(--fg-2);
+  text-decoration: none;
+  border-bottom: 1px dotted var(--fg-mute);
+}
+.pfooter .spacer { flex: 1; }
+.pfooter .pm {
+  display: inline-flex; align-items: center; gap: 4px;
+  color: var(--fg-2);
+}
+.pfooter .pm .d {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: var(--s-ok);
+}
+.pfooter .pm.idle .d { background: var(--fg-mute); }
+
+/* ── Tooltips ── */
+[data-tip] { position: relative; }
+[data-tip]::after {
+  content: attr(data-tip);
+  position: absolute;
+  bottom: calc(100% + 7px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--bg-3);
+  color: var(--fg-2);
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  padding: 4px 8px;
+  font-size: 9px;
+  line-height: 1.5;
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.1s;
+  z-index: 999;
+}
+[data-tip]::before {
+  content: '';
+  position: absolute;
+  bottom: calc(100% + 2px);
+  left: 50%;
+  transform: translateX(-50%);
+  border: 4px solid transparent;
+  border-top-color: var(--border);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.1s;
+  z-index: 999;
+}
+[data-tip]:hover::after { opacity: 1; transition: opacity 0.15s 0.45s; }
+[data-tip]:hover::before { opacity: 1; transition: opacity 0.15s 0.45s; }
+[data-tip][data-tip-pos="below"]::after { bottom: auto; top: calc(100% + 7px); }
+[data-tip][data-tip-pos="below"]::before {
+  bottom: auto; top: calc(100% + 2px);
+  border-top-color: transparent; border-bottom-color: var(--border);
+}
+[data-tip][data-tip-align="right"]::after { left: auto; right: 0; transform: none; }
+[data-tip][data-tip-align="right"]::before { left: auto; right: 8px; transform: none; }
+.input-wrap { flex: 1; min-width: 0; position: relative; display: block; }
+.input-wrap .host-input { width: 100%; }
 </style>
 </head>
 <body>
-  <h2><span class="dot" id="dot"></span> API Overlay</h2>
-  <div id="controls-section">
-    <button id="btn-theme">Light Theme</button>
-    <button id="btn-toggle">Hide Panel</button>
-    <button id="btn-pause">Pause Capture</button>
-    <button id="btn-export">Export HAR</button>
-    <button id="btn-clear" class="danger">Clear All Calls</button>
+
+<!-- Header -->
+<div class="phead">
+  <div class="mark" data-tip="API overlay monitor" data-tip-pos="below">CA</div>
+  <div class="title">CalloutAPI</div>
+  <div class="ver" data-tip="Extension version" data-tip-pos="below" data-tip-align="right">v1.0.1</div>
+</div>
+
+<!-- Current Site -->
+<div class="section">
+  <div class="sec-head">
+    <span>Current site</span>
+    <span class="badge off" id="status-badge" data-tip="Capture status for this site" data-tip-pos="below" data-tip-align="right">inactive</span>
   </div>
-  <hr class="divider"/>
-  <div class="section-label">Allowed Sites</div>
-  <div id="host-add-row">
-    <input id="host-input" placeholder="hostname.com" autocomplete="off" spellcheck="false"/>
-    <button id="btn-add-host">Add</button>
+  <div class="status-line off" id="status-line">
+    <span class="sd" id="status-dot"></span>
+    <span class="host" id="status-host">—</span>
+    <span class="state" id="status-meta">add to enable</span>
   </div>
-  <div id="host-list"></div>
-  <div class="hint">Adding <code>example.com</code> also enables all subdomains. Click any row to expand payload. Hover to highlight trigger element on page.</div>
-  <script src="dist/popup.js"></script>
+  <!-- Shown when capturing -->
+  <div id="capturing-btns" style="display:none">
+    <div class="row">
+      <button class="btn primary" id="btn-pause" data-tip="Pause or resume request capturing">⏸ pause</button>
+      <button class="btn" id="btn-toggle" data-tip="Show or hide the overlay panel" data-tip-align="right">👁 hide panel</button>
+    </div>
+    <div class="row">
+      <button class="btn dim" id="btn-export" data-tip="Export captured requests as HAR file">↓ export har</button>
+      <button class="btn dim" id="btn-clear" data-tip="Clear all captured requests" data-tip-align="right">✕ clear</button>
+    </div>
+  </div>
+  <!-- Shown when not capturing -->
+  <div id="enable-row">
+    <button class="btn primary" id="btn-enable" style="width:100%" data-tip="Add this site to the allowlist and start capturing">+ enable on this site</button>
+  </div>
+</div>
+
+<!-- Allowed Sites -->
+<div class="section">
+  <div class="sec-head">
+    <span>Allowed sites (<span id="site-count">0</span>)</span>
+    <span class="badge" data-tip="Allowing example.com also covers sub.example.com" data-tip-align="right">subdomains inherit</span>
+  </div>
+  <div class="input-row">
+    <span class="input-wrap" data-tip="Enter a hostname — subdomains inherit automatically">
+      <input class="host-input" id="host-input" placeholder="hostname.com" autocomplete="off" spellcheck="false"/>
+    </span>
+    <button class="add-btn" id="btn-add-host" data-tip="Add to allowlist" data-tip-align="right">add</button>
+  </div>
+  <div class="host-list" id="host-list"></div>
+</div>
+
+<!-- Appearance -->
+<div class="section">
+  <div class="sec-head"><span>Appearance</span></div>
+  <div class="row">
+    <button class="btn primary" id="btn-dark" data-tip="Switch to dark theme">dark</button>
+    <button class="btn" id="btn-light" data-tip="Switch to light theme" data-tip-align="right">light</button>
+  </div>
+</div>
+
+<!-- Footer -->
+<div class="pfooter">
+  <span class="pm idle" id="footer-pm" data-tip="Overlay connection — live when capturing">
+    <span class="d"></span>
+    <span id="footer-status">idle</span>
+  </span>
+  <span class="spacer"></span>
+</div>
+
+<script src="dist/popup.js"></script>
 </body>
 </html>

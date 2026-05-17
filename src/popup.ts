@@ -2,13 +2,11 @@
 
 let visible = true;
 let capturePaused = false;
-let popupTheme: 'dark' | 'light' = 'dark';
 let siteEnabled = false;
 let allowedHosts: string[] = [];
 let currentHostname = '';
-// Popup is bound to one tab/window for its lifetime — cache the id at init to
-// avoid re-querying chrome.tabs on every click.
 let currentTabId: number | null = null;
+let requestCount = 0;
 
 function sendMessageSafe(tabId: number, message: Record<string, unknown>): Promise<unknown | null> {
   return new Promise(resolve => {
@@ -29,11 +27,8 @@ async function send(action: string, extra: Record<string, unknown> = {}): Promis
 
 function popupEscHtml(str: unknown): string {
   return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 function normalizeHost(raw: string): string {
@@ -47,70 +42,105 @@ function normalizeHost(raw: string): string {
   }
 }
 
-// "example.com" matches example.com and any subdomain; narrower entries don't widen.
-function popupHostAllowed(allowedHosts: string[], current: string): boolean {
+function popupHostAllowed(hosts: string[], current: string): boolean {
   if (!current) return false;
-  return allowedHosts.some(h => h === current || current.endsWith(`.${h}`));
+  return hosts.some(h => h === current || current.endsWith(`.${h}`));
 }
 
+// ── DOM refs ──────────────────────────────────────────────────────────────────
+
+const statusBadge   = document.getElementById('status-badge') as HTMLElement;
+const statusLine    = document.getElementById('status-line') as HTMLElement;
+const statusMeta    = document.getElementById('status-meta') as HTMLElement;
+const statusHost    = document.getElementById('status-host') as HTMLElement;
+const capturingBtns = document.getElementById('capturing-btns') as HTMLElement;
+const enableRow     = document.getElementById('enable-row') as HTMLElement;
+const btnEnable     = document.getElementById('btn-enable') as HTMLButtonElement;
+const btnToggle     = document.getElementById('btn-toggle') as HTMLButtonElement;
+const btnPause      = document.getElementById('btn-pause') as HTMLButtonElement;
+const btnExport     = document.getElementById('btn-export') as HTMLButtonElement;
+const btnClear      = document.getElementById('btn-clear') as HTMLButtonElement;
+const btnDark       = document.getElementById('btn-dark') as HTMLButtonElement;
+const btnLight      = document.getElementById('btn-light') as HTMLButtonElement;
+const hostInput     = document.getElementById('host-input') as HTMLInputElement;
+const btnAddHost    = document.getElementById('btn-add-host') as HTMLButtonElement;
+const siteCountEl   = document.getElementById('site-count') as HTMLElement;
+const footerPm      = document.getElementById('footer-pm') as HTMLElement;
+const footerStatus  = document.getElementById('footer-status') as HTMLElement;
+
+// ── State appliers ────────────────────────────────────────────────────────────
+
 function applyPopupTheme(theme: 'dark' | 'light'): void {
-  popupTheme = theme;
   document.body.dataset.theme = theme;
-  btnTheme.textContent = theme === 'dark' ? 'Light Theme' : 'Dark Theme';
+  btnDark.className  = `btn${theme === 'dark'  ? ' primary' : ''}`;
+  btnLight.className = `btn${theme === 'light' ? ' primary' : ''}`;
 }
 
 function applyVisibleState(v: boolean): void {
   visible = v;
-  btnToggle.textContent = v ? 'Hide Panel' : 'Show Panel';
-  updateDot();
+  btnToggle.textContent = v ? '👁 hide panel' : '👁 show panel';
 }
 
 function applyPausedState(p: boolean): void {
   capturePaused = p;
-  btnPause.textContent = p ? 'Resume Capture' : 'Pause Capture';
+  btnPause.textContent = p ? '▶ resume' : '⏸ pause';
 }
 
-const btnTheme = document.getElementById('btn-theme') as HTMLButtonElement;
-const btnToggle = document.getElementById('btn-toggle') as HTMLButtonElement;
-const btnPause = document.getElementById('btn-pause') as HTMLButtonElement;
-const dot = document.getElementById('dot') as HTMLElement;
-const hostInput = document.getElementById('host-input') as HTMLInputElement;
-const btnAddHost = document.getElementById('btn-add-host') as HTMLButtonElement;
-const controlsSection = document.getElementById('controls-section') as HTMLDivElement;
+function updateCurrentSiteSection(): void {
+  // status line
+  const isActive = siteEnabled;
+  statusLine.className = `status-line${isActive ? '' : ' off'}`;
 
-function updateDot(): void {
-  dot.className = `dot${(visible && siteEnabled) ? '' : ' off'}`;
+  // badge
+  statusBadge.textContent = isActive ? 'capturing' : 'inactive';
+  statusBadge.className = `badge${isActive ? ' on' : ' off'}`;
+
+  // hostname + meta
+  statusHost.textContent = currentHostname || '—';
+  if (isActive) {
+    statusMeta.textContent = requestCount > 0 ? `${requestCount} req` : '';
+    statusMeta.style.color = 'var(--accent)';
+  } else {
+    statusMeta.textContent = currentHostname ? 'add to enable' : '';
+    statusMeta.style.color = '';
+  }
+
+  // buttons
+  capturingBtns.style.display = isActive ? '' : 'none';
+  enableRow.style.display = isActive ? 'none' : '';
+  btnEnable.textContent = currentHostname
+    ? `+ enable on ${currentHostname}`
+    : '+ enable on this site';
+
+  // footer
+  const live = isActive;
+  footerPm.className = `pm${live ? '' : ' idle'}`;
+  footerStatus.textContent = live ? 'live' : 'idle';
 }
 
-function updateControlsState(): void {
-  controlsSection.classList.toggle('disabled', !siteEnabled);
-}
-
-function getTabHostname(tab: chrome.tabs.Tab | undefined): string {
-  try { return tab?.url ? new URL(tab.url).hostname : ''; } catch { return ''; }
-}
+// ── Host list rendering ───────────────────────────────────────────────────────
 
 function renderHostList(): void {
-  const list = document.getElementById('host-list');
-  if (!list) return;
+  const list = document.getElementById('host-list') as HTMLElement;
+  siteCountEl.textContent = String(allowedHosts.length);
   if (allowedHosts.length === 0) {
-    list.innerHTML = '<div class="host-empty">No sites added yet</div>';
+    list.innerHTML = '<div class="host-empty">no sites yet — add one above</div>';
     return;
   }
-  list.innerHTML = allowedHosts
-    .map((h, i) => {
-      const safe = popupEscHtml(h);
-      return `<div class="host-item">
-        <span class="host-name" title="${safe}">${safe}</span>
-        <button class="host-remove" data-index="${i}" title="Remove">×</button>
-      </div>`;
-    })
-    .join('');
+  list.innerHTML = allowedHosts.map((h, i) => {
+    const safe = popupEscHtml(h);
+    const isCurrent = currentHostname === h || currentHostname.endsWith(`.${h}`);
+    const nowBadge = isCurrent ? '<span class="host-now">● now</span>' : '';
+    return `<div class="host-item${isCurrent ? ' current' : ''}">
+      <span class="host-name" title="${safe}">${safe}</span>
+      ${nowBadge}
+      <button class="host-remove" data-index="${i}" title="Remove">×</button>
+    </div>`;
+  }).join('');
 }
 
 function bindHostListDelegation(): void {
-  const list = document.getElementById('host-list');
-  if (!list) return;
+  const list = document.getElementById('host-list') as HTMLElement;
   list.addEventListener('click', async (e: Event) => {
     const btn = (e.target as Element).closest<HTMLButtonElement>('.host-remove');
     if (!btn) return;
@@ -122,18 +152,18 @@ function bindHostListDelegation(): void {
     const stillAllowed = popupHostAllowed(allowedHosts, currentHostname);
     if (siteEnabled && !stillAllowed) {
       siteEnabled = false;
-      updateControlsState();
-      updateDot();
+      updateCurrentSiteSection();
       if (currentTabId != null) await sendMessageSafe(currentTabId, { action: 'deactivate' });
     }
   });
 }
 
+// ── Init ──────────────────────────────────────────────────────────────────────
+
 async function init(): Promise<void> {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   currentTabId = tab?.id ?? null;
-  currentHostname = getTabHostname(tab);
-  if (currentHostname) hostInput.value = currentHostname;
+  try { currentHostname = tab?.url ? new URL(tab.url).hostname : ''; } catch { currentHostname = ''; }
 
   allowedHosts = await new Promise<string[]>(resolve => {
     chrome.storage.local.get('ovAllowedHosts', ({ ovAllowedHosts }) => {
@@ -142,18 +172,18 @@ async function init(): Promise<void> {
   });
 
   siteEnabled = popupHostAllowed(allowedHosts, currentHostname);
-  updateControlsState();
   renderHostList();
   bindHostListDelegation();
 
   let synced = false;
   if (currentTabId != null) {
-    const response = await sendMessageSafe(currentTabId, { action: 'get-state' }) as
-      { visible?: boolean; paused?: boolean; theme?: 'dark' | 'light' } | null;
-    if (response) {
-      applyPopupTheme(response.theme || 'dark');
-      applyVisibleState(response.visible !== false);
-      applyPausedState(response.paused === true);
+    const resp = await sendMessageSafe(currentTabId, { action: 'get-state' }) as
+      { visible?: boolean; paused?: boolean; theme?: 'dark' | 'light'; count?: number } | null;
+    if (resp) {
+      applyPopupTheme(resp.theme || 'dark');
+      applyVisibleState(resp.visible !== false);
+      applyPausedState(resp.paused === true);
+      if (typeof resp.count === 'number') requestCount = resp.count;
       synced = true;
     }
   }
@@ -169,15 +199,21 @@ async function init(): Promise<void> {
     });
   }
 
-  updateDot();
+  updateCurrentSiteSection();
 }
 
 void init();
 
-btnTheme.addEventListener('click', async () => {
-  const next: 'dark' | 'light' = popupTheme === 'dark' ? 'light' : 'dark';
-  applyPopupTheme(next);
-  await send('theme', { value: next });
+// ── Button handlers ───────────────────────────────────────────────────────────
+
+btnDark.addEventListener('click', async () => {
+  applyPopupTheme('dark');
+  await send('theme', { value: 'dark' });
+});
+
+btnLight.addEventListener('click', async () => {
+  applyPopupTheme('light');
+  await send('theme', { value: 'light' });
 });
 
 btnToggle.addEventListener('click', async () => {
@@ -186,10 +222,7 @@ btnToggle.addEventListener('click', async () => {
   applyVisibleState(visible);
   if (currentTabId != null) {
     const ok = await sendMessageSafe(currentTabId, { action: 'toggle' });
-    if (ok === null) {
-      visible = prev;
-      applyVisibleState(visible);
-    }
+    if (ok === null) { visible = prev; applyVisibleState(visible); }
   }
 });
 
@@ -199,35 +232,36 @@ btnPause.addEventListener('click', async () => {
   applyPausedState(capturePaused);
   if (currentTabId != null) {
     const ok = await sendMessageSafe(currentTabId, { action: 'pause', value: capturePaused });
-    if (ok === null) {
-      capturePaused = prev;
-      applyPausedState(capturePaused);
-    }
+    if (ok === null) { capturePaused = prev; applyPausedState(capturePaused); }
   }
 });
 
-(document.getElementById('btn-export') as HTMLButtonElement).addEventListener('click', () => send('export-har'));
-(document.getElementById('btn-clear') as HTMLButtonElement).addEventListener('click', () => send('clear'));
+btnExport.addEventListener('click', () => send('export-har'));
+btnClear.addEventListener('click',  () => send('clear'));
+
+btnEnable.addEventListener('click', async () => {
+  if (!currentHostname) return;
+  if (!allowedHosts.includes(currentHostname)) {
+    allowedHosts.push(currentHostname);
+    await chrome.storage.local.set({ ovAllowedHosts: allowedHosts });
+    renderHostList();
+  }
+  siteEnabled = true;
+  updateCurrentSiteSection();
+  if (currentTabId != null) await sendMessageSafe(currentTabId, { action: 'activate' });
+});
 
 btnAddHost.addEventListener('click', async () => {
   const host = normalizeHost(hostInput.value);
-  if (!host) {
-    hostInput.value = '';
-    hostInput.placeholder = 'invalid hostname';
-    return;
-  }
-  if (allowedHosts.includes(host)) {
-    hostInput.value = host;
-    return;
-  }
+  if (!host) { hostInput.value = ''; hostInput.placeholder = 'invalid hostname'; return; }
+  if (allowedHosts.includes(host)) { hostInput.value = host; return; }
   allowedHosts.push(host);
-  hostInput.value = host;
+  hostInput.value = '';
   await chrome.storage.local.set({ ovAllowedHosts: allowedHosts });
   renderHostList();
   if (!siteEnabled && popupHostAllowed([host], currentHostname)) {
     siteEnabled = true;
-    updateControlsState();
-    updateDot();
+    updateCurrentSiteSection();
     if (currentTabId != null) await sendMessageSafe(currentTabId, { action: 'activate' });
   }
 });
