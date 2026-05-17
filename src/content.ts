@@ -12,6 +12,8 @@ interface WsMessage {
 }
 
 type RequestStatus = number | 'pending' | 'error' | 'closed';
+type HeaderPair = [string, string];
+type DetailTab = 'body' | 'headers';
 
 interface ApiRequest {
   id: number;
@@ -23,8 +25,15 @@ interface ApiRequest {
   ts: number;
   reqBody?: string | null;
   resBody?: string | null;
+  reqHeaders?: HeaderPair[] | null;
+  resHeaders?: HeaderPair[] | null;
   messages?: WsMessage[];
   ms?: number;
+  // Cached lowercase forms for body/url search. Recomputed when the source field
+  // updates so a keystroke doesn't re-lowercase MB of bodies.
+  _lcUrl?: string;
+  _lcReqBody?: string;
+  _lcResBody?: string;
 }
 
 interface OverlayMessage extends Partial<ApiRequest> {
@@ -40,6 +49,12 @@ const MAX_WS_MESSAGES_PER_CONN = 500;
 const WS_TRIM_TRIGGER = MAX_WS_MESSAGES_PER_CONN + 50;
 const RENDER_LIMIT = 200;
 const RENDER_THROTTLE_MS = 100;
+// JSON tree rendering + click-to-locate
+const MAX_JSON_RENDER_CHARS = 4000;
+const MAX_JSON_LEAF_LEN = 1000;
+const MAX_VALUE_HIGHLIGHTS = 50;
+const MIN_VALUE_LEN = 2;
+const MIN_SUBSTRING_LEN = 4;
 
 const requests = new Map<number, ApiRequest>();
 const expandedIds = new Set<number>();
@@ -56,6 +71,18 @@ let renderTimer: number | null = null;
 let lastRenderTime = 0;
 let filterInput: HTMLInputElement | null = null;
 let methodFilterSelect: HTMLSelectElement | null = null;
+let statusFilterSelect: HTMLSelectElement | null = null;
+let caseSensitiveSearch = false;
+let regexSearch = false;
+// Active detail tab per expanded row. Absent = default 'body'.
+const detailTabs = new Map<number, DetailTab>();
+
+// Click-to-locate state for response JSON values. Persists across rerenders so a
+// new request arriving doesn't blow away the user's active highlight.
+let valueHighlightEls: HTMLElement[] = [];
+let valueHighlightIndex = 0;
+// Key shape: `${rowId}|${kind}|${encodedRawValue}` — reattached on rerender.
+let valueHighlightKey = '';
 
 function scheduleRender(): void {
   if (renderScheduled) return;
@@ -95,6 +122,7 @@ function trimRequests(): void {
     if (k === undefined) break;
     requests.delete(k);
     expandedIds.delete(k);
+    detailTabs.delete(k);
     const timer = badgeTimers.get(k);
     if (timer !== undefined) {
       clearTimeout(timer);
@@ -103,6 +131,14 @@ function trimRequests(): void {
     badges.get(k)?.remove();
     badges.delete(k);
   }
+}
+
+// Refresh cached lowercase forms after an incoming message updates url/body
+// fields, so the search loop never lowercases bodies on every keystroke.
+function refreshSearchCache(req: ApiRequest, msg: OverlayMessage): void {
+  if (msg.url !== undefined) req._lcUrl = (req.url || '').toLowerCase();
+  if (msg.reqBody !== undefined) req._lcReqBody = req.reqBody ? req.reqBody.toLowerCase() : '';
+  if (msg.resBody !== undefined) req._lcResBody = req.resBody ? req.resBody.toLowerCase() : '';
 }
 
 window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
@@ -130,10 +166,14 @@ window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
   if (msg.id == null) return;
 
   if (requests.has(msg.id)) {
-    Object.assign(requests.get(msg.id)!, msg);
+    const existing = requests.get(msg.id)!;
+    Object.assign(existing, msg);
+    refreshSearchCache(existing, msg);
   } else {
     if (paused) return; // drop new captures only; keep merging updates to in-flight ones.
-    requests.set(msg.id, { ...msg } as ApiRequest);
+    const fresh = { ...msg } as ApiRequest;
+    refreshSearchCache(fresh, msg);
+    requests.set(msg.id, fresh);
     trimRequests();
   }
 
@@ -175,7 +215,9 @@ chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, 
     case 'clear':
       requests.clear();
       expandedIds.clear();
+      detailTabs.clear();
       clearAllBadges();
+      clearValueHighlights();
       renderList();
       sendResponse({ ok: true });
       break;
@@ -253,29 +295,48 @@ function buildPanel(): void {
       </div>
     </div>
     <div id="ov-filter-row">
-      <input id="ov-filter" placeholder="Filter by URL..." autocomplete="off" spellcheck="false"/>
+      <input id="ov-filter" placeholder="Filter URL / body..." autocomplete="off" spellcheck="false"/>
+      <button id="ov-case-toggle" title="Case-sensitive">Aa</button>
+      <button id="ov-regex-toggle" title="Regex">.*</button>
       <select id="ov-method-filter">
         <option value="">All</option>
         <option>GET</option><option>POST</option><option>PUT</option>
         <option>DELETE</option><option>PATCH</option><option>WS</option>
       </select>
+      <select id="ov-status-filter" title="Status">
+        <option value="">Status</option>
+        <option value="2xx">2xx</option>
+        <option value="3xx">3xx</option>
+        <option value="4xx">4xx</option>
+        <option value="5xx">5xx</option>
+        <option value="err">Errors</option>
+      </select>
       <button id="ov-group-toggle">Group</button>
     </div>
     <div id="ov-list"></div>
-    <div id="ov-footer">Click row to expand payload. Hover to highlight trigger element.</div>
+    <div id="ov-footer">Click row to expand. Click a response value to find it on the page.</div>
+    <div class="ov-resize-handle" data-dir="n"></div>
+    <div class="ov-resize-handle" data-dir="s"></div>
+    <div class="ov-resize-handle" data-dir="e"></div>
+    <div class="ov-resize-handle" data-dir="w"></div>
+    <div class="ov-resize-handle" data-dir="ne"></div>
+    <div class="ov-resize-handle" data-dir="nw"></div>
+    <div class="ov-resize-handle" data-dir="se"></div>
+    <div class="ov-resize-handle" data-dir="sw"></div>
   `;
   if (!panelVisible) panel.style.setProperty('display', 'none', 'important');
   document.documentElement.appendChild(panel);
 
   filterInput = $('ov-filter') as HTMLInputElement;
   methodFilterSelect = $('ov-method-filter') as HTMLSelectElement;
+  statusFilterSelect = $('ov-status-filter') as HTMLSelectElement;
 
   $('ov-close')!.onclick = () => {
     panel.style.setProperty('display', 'none', 'important');
     panelVisible = false;
     chrome.storage.local.set({ ovVisible: false });
   };
-  $('ov-clear')!.onclick = () => { requests.clear(); expandedIds.clear(); clearAllBadges(); renderList(); };
+  $('ov-clear')!.onclick = () => { requests.clear(); expandedIds.clear(); detailTabs.clear(); clearAllBadges(); clearValueHighlights(); renderList(); };
   $('ov-pause')!.onclick = () => setPaused(!paused);
   $('ov-theme')!.onclick = () => {
     const next: 'dark' | 'light' = currentTheme === 'dark' ? 'light' : 'dark';
@@ -284,14 +345,28 @@ function buildPanel(): void {
   };
   filterInput.oninput = () => scheduleRender();
   methodFilterSelect.onchange = renderList;
+  statusFilterSelect.onchange = renderList;
   $('ov-export')!.onclick = exportHAR;
   $('ov-group-toggle')!.onclick = () => {
     groupByDomain = !groupByDomain;
     $('ov-group-toggle')!.classList.toggle('ov-active', groupByDomain);
     renderList();
   };
+  const caseBtn = $('ov-case-toggle')!;
+  const regexBtn = $('ov-regex-toggle')!;
+  caseBtn.onclick = () => {
+    caseSensitiveSearch = !caseSensitiveSearch;
+    caseBtn.classList.toggle('ov-active', caseSensitiveSearch);
+    renderList();
+  };
+  regexBtn.onclick = () => {
+    regexSearch = !regexSearch;
+    regexBtn.classList.toggle('ov-active', regexSearch);
+    renderList();
+  };
 
   makeDraggable(panel, $('ov-header')!);
+  makeResizable(panel);
   const list = $('ov-list');
   if (list) bindListDelegation(list);
   renderList();
@@ -328,27 +403,298 @@ function formatBody(text: string | null | undefined): string {
   return text;
 }
 
+// Parse only if the payload looks like an object/array. Strings, numbers, bools
+// at the top level are valid JSON but uninteresting as a clickable tree.
+function tryParseJsonContainer(text: string | null | undefined): unknown | undefined {
+  if (!text) return undefined;
+  const t = text.trimStart();
+  if (!t.startsWith('{') && !t.startsWith('[')) return undefined;
+  try { return JSON.parse(text); } catch { return undefined; }
+}
+
+interface JsonRenderState { chars: number; truncated: boolean }
+
+function renderJsonHtml(value: unknown): string {
+  const out: string[] = [];
+  const st: JsonRenderState = { chars: 0, truncated: false };
+  renderJsonNode(value, '', st, out);
+  if (st.truncated) out.push('\n<span class="ov-jv-trunc">… truncated</span>');
+  return out.join('');
+}
+
+function renderJsonNode(v: unknown, indent: string, st: JsonRenderState, out: string[]): void {
+  if (st.chars > MAX_JSON_RENDER_CHARS) { st.truncated = true; return; }
+  if (v === null) { writeJsonLeaf(out, st, 'null', 'null', 'null'); return; }
+  const t = typeof v;
+  if (t === 'string') {
+    const s = v as string;
+    const trimmed = s.length > MAX_JSON_LEAF_LEN ? s.slice(0, MAX_JSON_LEAF_LEN) : s;
+    const ell = trimmed.length < s.length ? '…' : '';
+    writeJsonLeaf(out, st, `"${escHtml(trimmed)}${ell}"`, 'string', trimmed);
+    return;
+  }
+  if (t === 'number' || t === 'boolean') {
+    const display = String(v);
+    writeJsonLeaf(out, st, display, t, display);
+    return;
+  }
+  if (Array.isArray(v)) {
+    if (v.length === 0) { out.push('[]'); st.chars += 2; return; }
+    out.push('[\n'); st.chars += 2;
+    const inner = `${indent}  `;
+    for (let i = 0; i < v.length; i++) {
+      if (st.chars > MAX_JSON_RENDER_CHARS) { st.truncated = true; break; }
+      out.push(inner); st.chars += inner.length;
+      renderJsonNode(v[i], inner, st, out);
+      if (i < v.length - 1) { out.push(','); st.chars += 1; }
+      out.push('\n'); st.chars += 1;
+    }
+    out.push(`${indent}]`); st.chars += indent.length + 1;
+    return;
+  }
+  if (t === 'object') {
+    const obj = v as Record<string, unknown>;
+    const keys = Object.keys(obj);
+    if (keys.length === 0) { out.push('{}'); st.chars += 2; return; }
+    out.push('{\n'); st.chars += 2;
+    const inner = `${indent}  `;
+    for (let i = 0; i < keys.length; i++) {
+      if (st.chars > MAX_JSON_RENDER_CHARS) { st.truncated = true; break; }
+      const k = keys[i];
+      out.push(`${inner}<span class="ov-jk">"${escHtml(k)}"</span>: `);
+      st.chars += inner.length + k.length + 4;
+      renderJsonNode(obj[k], inner, st, out);
+      if (i < keys.length - 1) { out.push(','); st.chars += 1; }
+      out.push('\n'); st.chars += 1;
+    }
+    out.push(`${indent}}`); st.chars += indent.length + 1;
+    return;
+  }
+  // unknown — render as JSON.stringify fallback so we don't drop data silently.
+  try {
+    const fallback = JSON.stringify(v);
+    if (fallback !== undefined) { out.push(escHtml(fallback)); st.chars += fallback.length; }
+  } catch { /* skip */ }
+}
+
+function writeJsonLeaf(out: string[], st: JsonRenderState, display: string, kind: string, raw: string): void {
+  out.push(`<span class="ov-jv ov-jv-${kind}" data-ov-val="${encodeURIComponent(raw)}" data-ov-kind="${kind}">${display}</span>`);
+  st.chars += display.length;
+}
+
+// Extract the first contiguous signed-decimal number from a text fragment and
+// normalize it (drops commas, trims units). Returns '' when no number is found.
+function normalizeNumber(s: string): string {
+  const m = s.replace(/,/g, '').match(/-?\d+(?:\.\d+)?/);
+  if (!m) return '';
+  const n = Number(m[0]);
+  return Number.isFinite(n) ? String(n) : '';
+}
+
+// Walk the host DOM for matches of `value`. Skips overlay-owned nodes. Caps
+// results so a vague match (e.g. "OK", "true") can't blanket the page.
+function findValuesInDom(value: string, kind: string): HTMLElement[] {
+  const trimmed = value.trim();
+  if (!trimmed) return [];
+  if (kind === 'boolean' || kind === 'null') return []; // too ambiguous to be useful
+  if (trimmed.length < MIN_VALUE_LEN) return [];
+
+  const results: HTMLElement[] = [];
+  const seen = new Set<HTMLElement>();
+  const ownedByOverlay = (el: Element | null): boolean =>
+    !!el && (!!el.closest('#ov-panel') || el.classList.contains('ov-float-badge'));
+  const collect = (el: HTMLElement | null): boolean => {
+    if (!el || seen.has(el) || ownedByOverlay(el)) return true;
+    seen.add(el);
+    results.push(el);
+    return results.length < MAX_VALUE_HIGHLIGHTS;
+  };
+
+  const lower = trimmed.toLowerCase();
+  const numNorm = kind === 'number' ? normalizeNumber(trimmed) : '';
+  const isUrlLike = kind === 'string' && (/^https?:\/\//i.test(trimmed) || trimmed.startsWith('/') || trimmed.startsWith('data:'));
+
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const parent = node.parentElement;
+      if (!parent || ownedByOverlay(parent)) return NodeFilter.FILTER_REJECT;
+      const tag = parent.tagName;
+      if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const text = (node.nodeValue || '').trim();
+    if (!text) continue;
+    let hit = false;
+    if (kind === 'number') {
+      if (numNorm && normalizeNumber(text) === numNorm) hit = true;
+    } else if (text === trimmed || text.toLowerCase() === lower) {
+      hit = true;
+    } else if (trimmed.length >= MIN_SUBSTRING_LEN && text.toLowerCase().includes(lower)) {
+      hit = true;
+    }
+    if (hit && !collect((node as Text).parentElement)) break;
+  }
+
+  if (kind === 'string' && results.length < MAX_VALUE_HIGHLIGHTS) {
+    const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>('input, textarea');
+    for (let i = 0; i < inputs.length; i++) {
+      const el = inputs[i];
+      const v = (el.value || '').trim();
+      if (!v) continue;
+      const matches = v === trimmed || (trimmed.length >= MIN_SUBSTRING_LEN && v.toLowerCase().includes(lower));
+      if (matches && !collect(el)) break;
+    }
+  }
+
+  if (isUrlLike && results.length < MAX_VALUE_HIGHLIGHTS) {
+    const urlEls = document.querySelectorAll<HTMLElement>('img[src], a[href], source[src], video[src], audio[src], iframe[src]');
+    for (let i = 0; i < urlEls.length; i++) {
+      const el = urlEls[i];
+      const src = el.getAttribute('src') || el.getAttribute('href') || '';
+      if (!src) continue;
+      const matches = src === trimmed || src.endsWith(trimmed) || (trimmed.length >= MIN_SUBSTRING_LEN && src.includes(trimmed));
+      if (matches && !collect(el)) break;
+    }
+  }
+
+  return results;
+}
+
+function focusValueHighlight(): void {
+  for (const el of valueHighlightEls) el.classList.remove('ov-value-current');
+  const el = valueHighlightEls[valueHighlightIndex];
+  if (!el) return;
+  el.classList.add('ov-value-current');
+  const rect = el.getBoundingClientRect();
+  const margin = 60;
+  const visible = rect.top >= margin && rect.bottom <= window.innerHeight - margin;
+  if (!visible) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function clearValueHighlights(): void {
+  for (const el of valueHighlightEls) {
+    el.classList.remove('ov-value-match');
+    el.classList.remove('ov-value-current');
+  }
+  valueHighlightEls = [];
+  valueHighlightIndex = 0;
+  valueHighlightKey = '';
+  for (const el of document.querySelectorAll('.ov-jv-active')) el.classList.remove('ov-jv-active');
+  document.getElementById('ov-value-status')?.remove();
+}
+
+function setValueStatusBadge(jv: HTMLElement, total: number, index: number): void {
+  let el = document.getElementById('ov-value-status');
+  if (!el) {
+    el = document.createElement('span');
+    el.id = 'ov-value-status';
+    el.className = 'ov-value-status';
+  }
+  if (total === 0) el.textContent = 'no match on page';
+  else if (total === 1) el.textContent = '1 match';
+  else el.textContent = `${index + 1}/${total} · click to cycle`;
+  el.dataset.empty = total === 0 ? '1' : '';
+  jv.after(el);
+}
+
+function handleJsonValueClick(jv: HTMLElement): void {
+  const row = jv.closest<HTMLElement>('.ov-row');
+  const rowId = row?.dataset.id || '';
+  const encVal = jv.dataset.ovVal || '';
+  const kind = jv.dataset.ovKind || 'string';
+  const key = `${rowId}|${kind}|${encVal}`;
+  const value = decodeURIComponent(encVal);
+
+  if (key === valueHighlightKey && valueHighlightEls.length > 1) {
+    valueHighlightIndex = (valueHighlightIndex + 1) % valueHighlightEls.length;
+    focusValueHighlight();
+    setValueStatusBadge(jv, valueHighlightEls.length, valueHighlightIndex);
+    return;
+  }
+
+  clearValueHighlights();
+  const matches = findValuesInDom(value, kind);
+  valueHighlightKey = key;
+  valueHighlightEls = matches;
+  valueHighlightIndex = 0;
+  for (const el of matches) el.classList.add('ov-value-match');
+  if (matches.length > 0) focusValueHighlight();
+  jv.classList.add('ov-jv-active');
+  setValueStatusBadge(jv, matches.length, 0);
+}
+
+// After renderList rebuilds the row HTML, restore the active span styling and
+// the status badge. If the row collapsed or scrolled out of the limit, drop the
+// on-page highlights entirely.
+function reattachValueHighlight(): void {
+  if (!valueHighlightKey) return;
+  const parts = valueHighlightKey.split('|');
+  if (parts.length < 3) return;
+  const [rowId, kind, encVal] = parts;
+  const span = document.querySelector<HTMLElement>(
+    `#ov-list .ov-row[data-id="${rowId}"] .ov-jv[data-ov-kind="${kind}"][data-ov-val="${encVal}"]`
+  );
+  if (!span) {
+    clearValueHighlights();
+    return;
+  }
+  span.classList.add('ov-jv-active');
+  setValueStatusBadge(span, valueHighlightEls.length, valueHighlightIndex);
+}
+
 function getHostname(url: string): string {
   try { return new URL(url).hostname; } catch { return 'unknown'; }
+}
+
+// Bucket for status filter + color badge: 'pending' | 'err' | '2xx' | '3xx' | '4xx' | '5xx'
+function statusBucket(req: ApiRequest): string {
+  const s = req.status;
+  if (s === 'pending') return 'pending';
+  if (s === 'error') return 'err';
+  if (req.kind === 'ws') {
+    if (s === 'closed') return '2xx';
+    if (typeof s === 'number' && s === 101) return '2xx';
+    return 'err';
+  }
+  if (typeof s === 'number') {
+    if (s >= 500) return '5xx';
+    if (s >= 400) return '4xx';
+    if (s >= 300) return '3xx';
+    if (s >= 200) return '2xx';
+  }
+  return 'err';
+}
+
+function headerRowsHtml(label: string, headers: HeaderPair[] | null | undefined): string {
+  if (!headers || headers.length === 0) {
+    return `<div class="ov-detail-section"><div class="ov-detail-label">${label}</div><div class="ov-body-none">No headers</div></div>`;
+  }
+  const rows = headers.map(([n, v]) =>
+    `<div class="ov-hdr-row"><span class="ov-hdr-name">${escHtml(n)}</span><span class="ov-hdr-val">${escHtml(v)}</span></div>`
+  ).join('');
+  return `<div class="ov-detail-section">
+    <div class="ov-detail-label">${label}</div>
+    <div class="ov-hdr-table">${rows}</div>
+  </div>`;
 }
 
 function rowHtml(req: ApiRequest): string {
   const shortUrl = (() => {
     try {
       const u = new URL(req.url);
-      return u.pathname + (u.search.length > 30 ? u.search.slice(0, 30) + '...' : u.search);
+      return u.pathname + (u.search.length > 30 ? `${u.search.slice(0, 30)}...` : u.search);
     } catch { return req.url?.slice(0, 60) || ''; }
   })();
 
-  const statusClass = req.status === 'pending' ? 'pending'
-    : (req.status === 'error' || req.status === 'closed') ? 'err'
-    : (req.kind === 'ws' && req.status === 101) ? 'ok'
-    : (typeof req.status === 'number' && req.status >= 200 && req.status < 400) ? 'ok' : 'err';
-
+  const bucket = statusBucket(req);
   const statusLabel = req.status === 'pending' ? '...' : String(req.status);
   const triggerLabel = req.element?.label ? `"${req.element.label.slice(0, 45)}"` : 'background / auto';
   const isExpanded = expandedIds.has(req.id);
   const method = req.method || 'GET';
+  const activeTab: DetailTab = detailTabs.get(req.id) || 'body';
 
   let detailHtml = '';
   if (isExpanded) {
@@ -366,22 +712,44 @@ function rowHtml(req: ApiRequest): string {
         }</div>
       </div>`;
     } else {
-      const reqSection = req.reqBody
-        ? `<div class="ov-detail-section">
-            <div class="ov-detail-label">REQUEST BODY</div>
-            <pre class="ov-body-pre">${escHtml(formatBody(req.reqBody).slice(0, 3000))}</pre>
-          </div>` : '';
+      const tabsHtml = `<div class="ov-tabs" data-id="${req.id}">
+        <button class="ov-tab${activeTab === 'body' ? ' ov-tab-active' : ''}" data-tab="body">Body</button>
+        <button class="ov-tab${activeTab === 'headers' ? ' ov-tab-active' : ''}" data-tab="headers">Headers</button>
+      </div>`;
 
-      const resSection = req.resBody != null
-        ? `<div class="ov-detail-section">
-            <div class="ov-detail-label">RESPONSE BODY</div>
-            <pre class="ov-body-pre">${escHtml(formatBody(req.resBody).slice(0, 3000))}</pre>
-          </div>`
-        : req.status === 'pending'
-          ? `<div class="ov-detail-section"><div class="ov-detail-label">RESPONSE BODY</div><div class="ov-body-none">Waiting...</div></div>`
-          : `<div class="ov-detail-section"><div class="ov-detail-label">RESPONSE BODY</div><div class="ov-body-none">No body captured</div></div>`;
+      let paneHtml = '';
+      if (activeTab === 'body') {
+        const reqSection = req.reqBody
+          ? `<div class="ov-detail-section">
+              <div class="ov-detail-label">REQUEST BODY</div>
+              <pre class="ov-body-pre">${escHtml(formatBody(req.reqBody).slice(0, 3000))}</pre>
+            </div>` : '';
 
-      detailHtml = `<div class="ov-detail">${reqSection}${resSection}</div>`;
+        let resBodyHtml: string;
+        if (req.resBody != null) {
+          const parsed = tryParseJsonContainer(req.resBody);
+          resBodyHtml = parsed !== undefined
+            ? `<div class="ov-body-json">${renderJsonHtml(parsed)}</div>`
+            : `<pre class="ov-body-pre">${escHtml(formatBody(req.resBody).slice(0, 3000))}</pre>`;
+        } else {
+          resBodyHtml = '';
+        }
+        const resSection = req.resBody != null
+          ? `<div class="ov-detail-section">
+              <div class="ov-detail-label">RESPONSE BODY</div>
+              ${resBodyHtml}
+            </div>`
+          : req.status === 'pending'
+            ? `<div class="ov-detail-section"><div class="ov-detail-label">RESPONSE BODY</div><div class="ov-body-none">Waiting...</div></div>`
+            : `<div class="ov-detail-section"><div class="ov-detail-label">RESPONSE BODY</div><div class="ov-body-none">No body captured</div></div>`;
+
+        paneHtml = reqSection + resSection;
+      } else {
+        paneHtml = headerRowsHtml('REQUEST HEADERS', req.reqHeaders)
+                 + headerRowsHtml('RESPONSE HEADERS', req.resHeaders);
+      }
+
+      detailHtml = `<div class="ov-detail">${tabsHtml}${paneHtml}</div>`;
     }
   }
 
@@ -395,8 +763,8 @@ function rowHtml(req: ApiRequest): string {
       <div class="ov-info">
         <div class="ov-url" title="${escHtml(req.url || '')}">${escHtml(shortUrl)}</div>
         <div class="ov-meta">
-          <span class="ov-status ${statusClass}">${statusLabel}</span>
-          ${req.ms ? `<span class="ov-ms">${req.ms}ms</span>` : ''}
+          <span class="ov-status s-${bucket}">${statusLabel}</span>
+          <span class="ov-ms">${req.ms != null ? `${req.ms}ms` : ''}</span>
           <span class="ov-kind">${req.kind?.toUpperCase() || ''}</span>
           ${wsMsgCount}
         </div>
@@ -422,8 +790,45 @@ function renderList(): void {
     return;
   }
 
-  const filterText = (filterInput?.value || '').toLowerCase();
+  const rawFilter = filterInput?.value || '';
+  const filterText = caseSensitiveSearch ? rawFilter : rawFilter.toLowerCase();
   const filterMethod = methodFilterSelect?.value || '';
+  const filterStatus = statusFilterSelect?.value || '';
+
+  // Compile regex once per render (not per row). Invalid pattern = no rows shown,
+  // and we flag the filter input so the user knows why.
+  let regex: RegExp | null = null;
+  let regexInvalid = false;
+  if (regexSearch && rawFilter) {
+    try { regex = new RegExp(rawFilter, caseSensitiveSearch ? '' : 'i'); }
+    catch { regexInvalid = true; }
+  }
+  filterInput?.classList.toggle('ov-filter-invalid', regexInvalid);
+
+  function matchesText(r: ApiRequest): boolean {
+    if (!filterText) return true;
+    if (regexInvalid) return false;
+    if (regex) {
+      return regex.test(r.url || '')
+          || (r.reqBody != null && regex.test(r.reqBody))
+          || (r.resBody != null && regex.test(r.resBody));
+    }
+    if (caseSensitiveSearch) {
+      return (r.url || '').includes(filterText)
+          || (r.reqBody != null && r.reqBody.includes(filterText))
+          || (r.resBody != null && r.resBody.includes(filterText));
+    }
+    return (r._lcUrl || '').includes(filterText)
+        || (r._lcReqBody != null && r._lcReqBody.includes(filterText))
+        || (r._lcResBody != null && r._lcResBody.includes(filterText));
+  }
+
+  function matchesStatus(r: ApiRequest): boolean {
+    if (!filterStatus) return true;
+    const b = statusBucket(r);
+    if (filterStatus === 'err') return b === 'err' || b === '4xx' || b === '5xx';
+    return b === filterStatus;
+  }
 
   // Walk insertion order once into a snapshot, then iterate that snapshot
   // backward (newest first) collecting matches until we hit RENDER_LIMIT.
@@ -433,8 +838,9 @@ function renderList(): void {
   const visible: ApiRequest[] = [];
   for (let i = snapshot.length - 1; i >= 0 && visible.length < RENDER_LIMIT; i--) {
     const r = snapshot[i];
-    if (filterText && !r.url?.toLowerCase().includes(filterText)) continue;
     if (filterMethod && r.method !== filterMethod) continue;
+    if (!matchesStatus(r)) continue;
+    if (!matchesText(r)) continue;
     visible.push(r);
   }
 
@@ -479,6 +885,8 @@ function renderList(): void {
   } else {
     list.innerHTML = visible.map(rowHtml).join('');
   }
+
+  reattachValueHighlight();
 }
 
 let rowEventsBound = false;
@@ -524,11 +932,33 @@ function bindListDelegation(list: HTMLElement): void {
       }
       return;
     }
+    const tabBtn = target.closest<HTMLElement>('.ov-tab');
+    if (tabBtn) {
+      e.stopPropagation();
+      const wrap = tabBtn.parentElement as HTMLElement | null;
+      const id = Number(wrap?.dataset.id);
+      const tab = tabBtn.dataset.tab as DetailTab | undefined;
+      if (!Number.isFinite(id) || !tab) return;
+      detailTabs.set(id, tab);
+      scheduleRender();
+      return;
+    }
+    const jv = target.closest<HTMLElement>('.ov-jv');
+    if (jv) {
+      e.stopPropagation();
+      handleJsonValueClick(jv);
+      return;
+    }
     const row = target.closest<HTMLElement>('.ov-row');
     if (!row) return;
     const id = Number(row.dataset.id);
-    if (expandedIds.has(id)) expandedIds.delete(id);
-    else expandedIds.add(id);
+    if (expandedIds.has(id)) {
+      expandedIds.delete(id);
+      detailTabs.delete(id);
+      if (valueHighlightKey.startsWith(`${id}|`)) clearValueHighlights();
+    } else {
+      expandedIds.add(id);
+    }
     scheduleRender();
   });
 }
@@ -549,6 +979,8 @@ function exportHAR(): void {
 
   const encoder = new TextEncoder();
   const byteLen = (s: string | null | undefined): number => s ? encoder.encode(s).length : -1;
+  const toHarHeaders = (hs: HeaderPair[] | null | undefined): { name: string; value: string }[] =>
+    hs ? hs.map(([name, value]) => ({ name, value })) : [];
 
   const entries = [...requests.values()]
     .filter(r => r.kind !== 'ws' && typeof r.status === 'number')
@@ -559,7 +991,7 @@ function exportHAR(): void {
         method: r.method || 'GET',
         url: r.url || '',
         httpVersion: 'HTTP/1.1',
-        headers: [],
+        headers: toHarHeaders(r.reqHeaders),
         queryString: parseQuery(r.url),
         cookies: [],
         headersSize: -1,
@@ -570,7 +1002,7 @@ function exportHAR(): void {
         status: r.status as number,
         statusText: '',
         httpVersion: 'HTTP/1.1',
-        headers: [],
+        headers: toHarHeaders(r.resHeaders),
         cookies: [],
         content: {
           size: byteLen(r.resBody),
@@ -698,6 +1130,62 @@ function makeDraggable(panel: HTMLElement, handle: HTMLElement): void {
   });
 }
 
+function makeResizable(panel: HTMLElement): void {
+  panel.addEventListener('mousedown', (e: MouseEvent) => {
+    const handle = (e.target as Element).closest<HTMLElement>('.ov-resize-handle');
+    if (!handle) return;
+    const dir = handle.dataset.dir ?? '';
+    e.preventDefault();
+    e.stopPropagation();
+
+    const rect = panel.getBoundingClientRect();
+    panel.style.setProperty('left', `${rect.left}px`, 'important');
+    panel.style.setProperty('top', `${rect.top}px`, 'important');
+    panel.style.setProperty('right', 'auto', 'important');
+    panel.style.setProperty('bottom', 'auto', 'important');
+    panel.style.setProperty('width', `${rect.width}px`, 'important');
+    panel.style.setProperty('height', `${rect.height}px`, 'important');
+
+    const startX = e.clientX;
+    const startY = e.clientY;
+    const startLeft = rect.left;
+    const startTop = rect.top;
+    const startW = rect.width;
+    const startH = rect.height;
+
+    const move = (ev: MouseEvent) => {
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+      let left = startLeft, top = startTop, w = startW, h = startH;
+
+      if (dir.includes('e')) w = Math.min(window.innerWidth * 0.95, Math.max(320, startW + dx));
+      if (dir.includes('s')) h = Math.min(window.innerHeight * 0.95, Math.max(240, startH + dy));
+      if (dir.includes('w')) {
+        const clampedDx = Math.min(startW - 320, dx);
+        w = startW - clampedDx;
+        left = startLeft + clampedDx;
+      }
+      if (dir.includes('n')) {
+        const clampedDy = Math.min(startH - 240, dy);
+        h = startH - clampedDy;
+        top = startTop + clampedDy;
+      }
+
+      panel.style.setProperty('left', `${left}px`, 'important');
+      panel.style.setProperty('top', `${top}px`, 'important');
+      panel.style.setProperty('width', `${w}px`, 'important');
+      panel.style.setProperty('height', `${h}px`, 'important');
+    };
+
+    const up = () => {
+      document.removeEventListener('mousemove', move);
+      document.removeEventListener('mouseup', up);
+    };
+    document.addEventListener('mousemove', move);
+    document.addEventListener('mouseup', up);
+  });
+}
+
 function injectStyles(): void {
   if ($('ov-styles')) return;
   const s = document.createElement('style');
@@ -747,7 +1235,11 @@ function injectStyles(): void {
       bottom: 20px !important;
       right: 20px !important;
       width: 440px !important;
-      max-height: 620px !important;
+      height: 620px !important;
+      min-width: 320px !important;
+      min-height: 240px !important;
+      max-width: 95vw !important;
+      max-height: 95vh !important;
       background: var(--ov-bg) !important;
       color: var(--ov-text) !important;
       border-radius: 14px !important;
@@ -852,7 +1344,7 @@ function injectStyles(): void {
       flex-shrink: 0 !important;
       align-items: center !important;
     }
-    #ov-filter, #ov-method-filter {
+    #ov-filter, #ov-method-filter, #ov-status-filter {
       all: unset !important;
       background: var(--ov-input-bg) !important;
       border: 1px solid var(--ov-input-border) !important;
@@ -862,9 +1354,14 @@ function injectStyles(): void {
       font-size: 11px !important;
       font-family: inherit !important;
     }
-    #ov-filter { flex: 1 !important; }
-    #ov-method-filter { width: 72px !important; }
-    #ov-group-toggle {
+    #ov-filter { flex: 1 !important; min-width: 60px !important; }
+    #ov-filter.ov-filter-invalid {
+      border-color: #ef5350 !important;
+      color: #ef5350 !important;
+    }
+    #ov-method-filter { width: 68px !important; }
+    #ov-status-filter { width: 64px !important; }
+    #ov-group-toggle, #ov-case-toggle, #ov-regex-toggle {
       all: unset !important;
       background: var(--ov-input-bg) !important;
       border: 1px solid var(--ov-input-border) !important;
@@ -876,8 +1373,15 @@ function injectStyles(): void {
       cursor: pointer !important;
       white-space: nowrap !important;
     }
-    #ov-group-toggle:hover { background: var(--ov-btn-hover) !important; color: var(--ov-text) !important; }
-    #ov-group-toggle.ov-active {
+    #ov-case-toggle, #ov-regex-toggle {
+      padding: 4px 6px !important;
+      font-weight: 700 !important;
+      letter-spacing: 0 !important;
+    }
+    #ov-group-toggle:hover, #ov-case-toggle:hover, #ov-regex-toggle:hover {
+      background: var(--ov-btn-hover) !important; color: var(--ov-text) !important;
+    }
+    #ov-group-toggle.ov-active, #ov-case-toggle.ov-active, #ov-regex-toggle.ov-active {
       background: var(--ov-grp-act-bg) !important;
       border-color: var(--ov-grp-act-brd) !important;
       color: var(--ov-grp-act-fg) !important;
@@ -887,9 +1391,9 @@ function injectStyles(): void {
       flex: 1 !important;
       padding: 6px !important;
     }
-    #ov-list::-webkit-scrollbar { width: 4px !important; }
-    #ov-list::-webkit-scrollbar-track { background: var(--ov-bg) !important; }
-    #ov-list::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; border-radius: 4px !important; }
+    #ov-list::-webkit-scrollbar { width: 12px !important; }
+    #ov-list::-webkit-scrollbar-track { background: var(--ov-bg) !important; border-radius: 6px !important; }
+    #ov-list::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; border-radius: 6px !important; border: 2px solid var(--ov-bg) !important; }
     #ov-footer {
       padding: 5px 12px !important;
       font-size: 10px !important;
@@ -898,6 +1402,18 @@ function injectStyles(): void {
       text-align: center !important;
       flex-shrink: 0 !important;
     }
+    .ov-resize-handle {
+      position: absolute !important;
+      z-index: 10 !important;
+    }
+    .ov-resize-handle[data-dir="n"]  { top:0 !important; left:12px !important; right:12px !important; height:5px !important; cursor:n-resize !important; }
+    .ov-resize-handle[data-dir="s"]  { bottom:0 !important; left:12px !important; right:12px !important; height:5px !important; cursor:s-resize !important; }
+    .ov-resize-handle[data-dir="e"]  { top:12px !important; right:0 !important; bottom:12px !important; width:5px !important; cursor:e-resize !important; }
+    .ov-resize-handle[data-dir="w"]  { top:12px !important; left:0 !important; bottom:12px !important; width:5px !important; cursor:w-resize !important; }
+    .ov-resize-handle[data-dir="nw"] { top:0 !important; left:0 !important; width:12px !important; height:12px !important; cursor:nw-resize !important; border-top-left-radius:14px !important; }
+    .ov-resize-handle[data-dir="ne"] { top:0 !important; right:0 !important; width:12px !important; height:12px !important; cursor:ne-resize !important; border-top-right-radius:14px !important; }
+    .ov-resize-handle[data-dir="sw"] { bottom:0 !important; left:0 !important; width:12px !important; height:12px !important; cursor:sw-resize !important; border-bottom-left-radius:14px !important; }
+    .ov-resize-handle[data-dir="se"] { bottom:0 !important; right:0 !important; width:12px !important; height:12px !important; cursor:se-resize !important; border-bottom-right-radius:14px !important; }
     .ov-empty {
       color: var(--ov-text-faint) !important;
       text-align: center !important;
@@ -978,11 +1494,27 @@ function injectStyles(): void {
       color: var(--ov-text-muted) !important;
       align-items: center !important;
     }
-    .ov-status { font-weight: 700 !important; }
-    .ov-status.ok      { color: #66bb6a !important; }
-    .ov-status.err     { color: #ef5350 !important; }
-    .ov-status.pending { color: #ffa726 !important; }
-    .ov-ms { color: var(--ov-text-muted) !important; }
+    .ov-status {
+      font-weight: 700 !important;
+      padding: 1px 5px !important;
+      border-radius: 3px !important;
+      min-width: 28px !important;
+      text-align: center !important;
+      display: inline-block !important;
+    }
+    .ov-status.s-2xx     { color: #a5d6a7 !important; background: rgba(102,187,106,.15) !important; }
+    .ov-status.s-3xx     { color: #ffcc80 !important; background: rgba(255,167,38,.15) !important; }
+    .ov-status.s-4xx     { color: #ffab91 !important; background: rgba(255,112,67,.18) !important; }
+    .ov-status.s-5xx     { color: #ef9a9a !important; background: rgba(239,83,80,.2) !important; }
+    .ov-status.s-err     { color: #ef5350 !important; background: rgba(239,83,80,.15) !important; }
+    .ov-status.s-pending { color: #ffa726 !important; background: rgba(255,167,38,.12) !important; }
+    .ov-ms {
+      color: var(--ov-text-muted) !important;
+      display: inline-block !important;
+      min-width: 44px !important;
+      text-align: right !important;
+      font-variant-numeric: tabular-nums !important;
+    }
     .ov-kind { color: var(--ov-text-faint) !important; }
     .ov-ws-count { color: #80deea !important; }
     .ov-trigger {
@@ -1012,6 +1544,60 @@ function injectStyles(): void {
       padding-top: 8px !important;
     }
     .ov-detail-section { margin-bottom: 8px !important; }
+    .ov-tabs {
+      display: flex !important;
+      gap: 4px !important;
+      margin-bottom: 8px !important;
+      border-bottom: 1px solid var(--ov-border) !important;
+    }
+    .ov-tab {
+      all: unset !important;
+      cursor: pointer !important;
+      padding: 4px 10px !important;
+      font-size: 10px !important;
+      font-weight: 700 !important;
+      letter-spacing: .04em !important;
+      color: var(--ov-text-muted) !important;
+      border-bottom: 2px solid transparent !important;
+      font-family: inherit !important;
+    }
+    .ov-tab:hover { color: var(--ov-text) !important; }
+    .ov-tab.ov-tab-active {
+      color: var(--ov-detail-lbl) !important;
+      border-bottom-color: var(--ov-detail-lbl) !important;
+    }
+    .ov-hdr-table {
+      background: var(--ov-pre-bg) !important;
+      border: 1px solid var(--ov-pre-border) !important;
+      border-radius: 4px !important;
+      padding: 4px 0 !important;
+      max-height: 180px !important;
+      overflow-y: auto !important;
+    }
+    .ov-hdr-table::-webkit-scrollbar { width: 12px !important; }
+    .ov-hdr-table::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; }
+    .ov-hdr-row {
+      display: flex !important;
+      gap: 8px !important;
+      padding: 2px 8px !important;
+      font-size: 10px !important;
+      line-height: 1.4 !important;
+      align-items: baseline !important;
+    }
+    .ov-hdr-row:hover { background: var(--ov-row-hover) !important; }
+    .ov-hdr-name {
+      color: var(--ov-detail-lbl) !important;
+      font-weight: 700 !important;
+      flex-shrink: 0 !important;
+      min-width: 110px !important;
+      max-width: 180px !important;
+      word-break: break-all !important;
+    }
+    .ov-hdr-val {
+      color: var(--ov-ws-text) !important;
+      word-break: break-all !important;
+      flex: 1 !important;
+    }
     .ov-detail-label {
       font-size: 9px !important;
       font-weight: 700 !important;
@@ -1034,8 +1620,69 @@ function injectStyles(): void {
       max-height: 150px !important;
       overflow-y: auto !important;
     }
-    .ov-body-pre::-webkit-scrollbar { width: 3px !important; }
+    .ov-body-pre::-webkit-scrollbar { width: 12px !important; }
     .ov-body-pre::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; }
+    .ov-body-json {
+      display: block !important;
+      background: var(--ov-pre-bg) !important;
+      border: 1px solid var(--ov-pre-border) !important;
+      border-radius: 4px !important;
+      padding: 6px 8px !important;
+      font-size: 10px !important;
+      font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace !important;
+      color: var(--ov-text) !important;
+      white-space: pre-wrap !important;
+      word-break: break-all !important;
+      max-height: 220px !important;
+      overflow-y: auto !important;
+    }
+    .ov-body-json::-webkit-scrollbar { width: 5px !important; }
+    .ov-body-json::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; }
+    .ov-jk { color: #82aaff !important; }
+    .ov-jv {
+      cursor: pointer !important;
+      border-radius: 2px !important;
+      padding: 0 1px !important;
+      transition: background .1s !important;
+    }
+    .ov-jv-string  { color: #c3e88d !important; }
+    .ov-jv-number  { color: #f78c6c !important; }
+    .ov-jv-boolean { color: #c792ea !important; }
+    .ov-jv-null    { color: #c792ea !important; font-style: italic !important; }
+    .ov-jv:hover { background: rgba(124,170,255,.18) !important; }
+    .ov-jv.ov-jv-active {
+      background: rgba(255,64,129,.22) !important;
+      box-shadow: inset 0 0 0 1px #ff4081 !important;
+    }
+    .ov-jv-trunc { color: var(--ov-text-faint) !important; font-style: italic !important; }
+    .ov-value-status {
+      display: inline-block !important;
+      margin-left: 6px !important;
+      padding: 0 6px !important;
+      background: #ff4081 !important;
+      color: #fff !important;
+      border-radius: 8px !important;
+      font-size: 9px !important;
+      font-weight: 700 !important;
+      letter-spacing: .03em !important;
+      vertical-align: middle !important;
+    }
+    .ov-value-status[data-empty="1"] { background: #555 !important; }
+    #ov-panel[data-theme="light"] .ov-body-json { color: var(--ov-text) !important; }
+    #ov-panel[data-theme="light"] .ov-jk { color: #3949ab !important; }
+    #ov-panel[data-theme="light"] .ov-jv-string  { color: #2e7d32 !important; }
+    #ov-panel[data-theme="light"] .ov-jv-number  { color: #d84315 !important; }
+    #ov-panel[data-theme="light"] .ov-jv-boolean { color: #6a1b9a !important; }
+    #ov-panel[data-theme="light"] .ov-jv-null    { color: #6a1b9a !important; }
+    .ov-value-match {
+      outline: 1.5px dashed #ff80ab !important;
+      outline-offset: 2px !important;
+    }
+    .ov-value-current {
+      outline: 2.5px solid #ff4081 !important;
+      outline-offset: 3px !important;
+      box-shadow: 0 0 0 5px rgba(255,64,129,.18) !important;
+    }
     .ov-body-none {
       font-size: 10px !important;
       color: var(--ov-text-faint) !important;
@@ -1045,7 +1692,7 @@ function injectStyles(): void {
       max-height: 200px !important;
       overflow-y: auto !important;
     }
-    .ov-ws-thread::-webkit-scrollbar { width: 3px !important; }
+    .ov-ws-thread::-webkit-scrollbar { width: 12px !important; }
     .ov-ws-thread::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; }
     .ov-ws-msg {
       display: flex !important;
@@ -1151,9 +1798,12 @@ function deactivateOverlay(): void {
   document.getElementById('ov-styles')?.remove();
   filterInput = null;
   methodFilterSelect = null;
+  statusFilterSelect = null;
   clearAllBadges();
+  clearValueHighlights();
   requests.clear();
   expandedIds.clear();
+  detailTabs.clear();
   // Reset UI state so a fresh re-activation isn't silently paused / hidden.
   paused = false;
   panelVisible = true;
