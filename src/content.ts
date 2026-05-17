@@ -63,7 +63,6 @@ const pinnedKeys = new Set<string>(); // `${method}|${urlNoQuery}`
 let panelVisible = true;
 let activeHighlight: HTMLElement | null = null;
 let paused = false;
-const groupByDomain = false;
 let currentTheme: 'dark' | 'light' = 'dark';
 let activated = false;
 let cspBlocked = false;
@@ -137,13 +136,17 @@ function refreshSearchCache(req: ApiRequest, msg: OverlayMessage): void {
 
 // ── Message handling ──────────────────────────────────────────────────────────
 
+function isSafeId(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0 && v < Number.MAX_SAFE_INTEGER;
+}
+
 window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
   if (e.source !== window) return;
   if (!e.data?.__apiOverlay || !activated) return;
   const msg = e.data;
 
   if (msg.__wsMsg) {
-    if (msg.wsId == null) return;
+    if (!isSafeId(msg.wsId)) return;
     const conn = requests.get(msg.wsId);
     if (conn) {
       if (!conn.messages) conn.messages = [];
@@ -158,7 +161,7 @@ window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
     return;
   }
 
-  if (msg.id == null) return;
+  if (!isSafeId(msg.id)) return;
 
   if (requests.has(msg.id)) {
     const existing = requests.get(msg.id)!;
@@ -284,6 +287,12 @@ function escHtml(str: unknown): string {
     .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
+// Malformed % escapes throw in decodeURIComponent and can break a delegated handler
+// for the rest of an event loop tick. Returning '' on failure keeps the UI alive.
+function safeDecodeURIComponent(s: string): string {
+  try { return decodeURIComponent(s); } catch { return ''; }
+}
+
 const VALID_HTTP_METHODS = new Set(['GET','POST','PUT','DELETE','PATCH','HEAD','OPTIONS','WS']);
 
 function safeMethodClass(method: string | null | undefined): string {
@@ -305,15 +314,11 @@ function middleTruncate(s: string, max: number): string {
 }
 
 function stripQuery(url: string): string {
-  try { return new URL(url).origin + new URL(url).pathname; } catch { return url; }
+  try { const u = new URL(url); return u.origin + u.pathname; } catch { return url; }
 }
 
 function pinKey(req: ApiRequest): string {
   return `${req.method}|${stripQuery(req.url)}`;
-}
-
-function getHostname(url: string): string {
-  try { return new URL(url).hostname; } catch { return 'unknown'; }
 }
 
 function formatBody(text: string | null | undefined): string {
@@ -637,7 +642,7 @@ function handleJsonValueClick(jv: HTMLElement): void {
   const encVal = jv.dataset.ovVal || '';
   const kind = jv.dataset.ovKind || 'string';
   const key = `${rowId}|${kind}|${encVal}`;
-  const value = decodeURIComponent(encVal);
+  const value = safeDecodeURIComponent(encVal);
   if (key === valueHighlightKey && valueHighlightEls.length > 1) {
     valueHighlightIndex = (valueHighlightIndex + 1) % valueHighlightEls.length;
     focusValueHighlight();
@@ -769,7 +774,7 @@ function rowHtml(req: ApiRequest): string {
 
   return `<div class="ov-row${isExpanded ? ' ov-expanded' : ''}${isPinned ? ' ov-pinned' : ''}"
       data-id="${req.id}" data-sel="${encodeURIComponent(req.element?.selector || '')}"
-      title="${escHtml(req.url)}${req.element?.label ? ' — ' + req.element.label : ''}">
+      title="${escHtml(req.url)}${req.element?.label ? ' — ' + escHtml(req.element.label) : ''}">
     <div class="ov-c ov-c-method m-${safeMethodClass(method)}">${escHtml(method)}</div>
     <div class="ov-c ov-c-status s-${bucket}">${statusLabel}</div>
     <div class="ov-c ov-c-dur">${durLabel}</div>
@@ -858,13 +863,17 @@ function renderList(): void {
   }
   filterInput?.classList.toggle('ov-filter-invalid', regexInvalid);
 
+  // Cap regex search input length per field. A pathological pattern (e.g. /(a+)+$/)
+  // on a 50KB body will hang the page; truncation bounds the worst case to a slice.
+  const REGEX_MAX_INPUT = 8000;
   function matchesText(r: ApiRequest): boolean {
     if (!filterText) return true;
     if (regexInvalid) return false;
     if (regex) {
-      return regex.test(r.url || '')
-          || (r.reqBody != null && regex.test(r.reqBody))
-          || (r.resBody != null && regex.test(r.resBody));
+      const clip = (s: string): string => s.length > REGEX_MAX_INPUT ? s.slice(0, REGEX_MAX_INPUT) : s;
+      return regex.test(clip(r.url || ''))
+          || (r.reqBody != null && regex.test(clip(r.reqBody)))
+          || (r.resBody != null && regex.test(clip(r.resBody)));
     }
     if (caseSensitiveSearch) {
       return (r.url || '').includes(filterText)
@@ -904,7 +913,7 @@ function renderList(): void {
     visible.push(r);
   }
 
-  if (countEl) countEl.textContent = String(requests.size);
+  if (countEl) countEl.textContent = `${visible.length}/${requests.size}`;
 
   // update chip counts
   updateChipCounts(snapshot);
@@ -919,28 +928,6 @@ function renderList(): void {
         ? 'No API calls captured yet.<br><small>Interact with the page to see calls appear here.</small>'
         : 'No results match your filter.'
     }</div>`;
-  } else if (groupByDomain) {
-    const groups = new Map<string, ApiRequest[]>();
-    for (const req of visible) {
-      const host = getHostname(req.url);
-      if (!groups.has(host)) groups.set(host, []);
-      groups.get(host)!.push(req);
-    }
-    const pageHost = location.hostname;
-    const sorted = [...groups.entries()].sort(([a], [b]) => {
-      if (a === pageHost && b !== pageHost) return -1;
-      if (b === pageHost && a !== pageHost) return 1;
-      return a.localeCompare(b);
-    });
-    html += sorted.map(([host, reqs]) => {
-      const fp = host === pageHost || host.endsWith('.' + pageHost) || pageHost.endsWith('.' + host);
-      return `<div class="ov-domain-group">
-        <div class="ov-domain-header ${fp ? 'ov-first-party' : 'ov-third-party'}">
-          <span>${escHtml(host)}</span><span class="ov-domain-count">${reqs.length}</span>
-        </div>
-        ${reqs.map(r => rowHtml(r)).join('')}
-      </div>`;
-    }).join('');
   } else {
     html += visible.map(r => rowHtml(r)).join('');
   }
@@ -976,7 +963,7 @@ function bindListDelegation(list: HTMLElement): void {
     if (!row || !list.contains(row)) return;
     const related = (e as MouseEvent).relatedTarget as Element | null;
     if (related && row.contains(related)) return;
-    const sel = decodeURIComponent(row.dataset.sel || '');
+    const sel = safeDecodeURIComponent(row.dataset.sel || '');
     if (sel) highlightEl(sel);
   });
 
@@ -1013,7 +1000,7 @@ function bindListDelegation(list: HTMLElement): void {
     const copyBtn = target.closest<HTMLElement>('.ov-copy-btn');
     if (copyBtn) {
       e.stopPropagation();
-      const url = decodeURIComponent(copyBtn.dataset.url || '');
+      const url = safeDecodeURIComponent(copyBtn.dataset.url || '');
       const restore = (label: string) => {
         copyBtn.textContent = label;
         setTimeout(() => { copyBtn.textContent = 'copy'; }, 900);
@@ -1390,11 +1377,21 @@ function makeDraggable(panel: HTMLElement, handle: HTMLElement): void {
   handle.addEventListener('mousedown', (e: MouseEvent) => {
     if ((e.target as HTMLElement).tagName === 'BUTTON') return;
     e.preventDefault();
-    ox = e.clientX - panel.getBoundingClientRect().left;
-    oy = e.clientY - panel.getBoundingClientRect().top;
+    const rect0 = panel.getBoundingClientRect();
+    ox = e.clientX - rect0.left;
+    oy = e.clientY - rect0.top;
+    // Keep at least this much of the panel onscreen so the user can always grab it back.
+    const KEEP_VISIBLE = 60;
     const move = (ev: MouseEvent) => {
-      panel.style.left = (ev.clientX - ox) + 'px';
-      panel.style.top = (ev.clientY - oy) + 'px';
+      const w = panel.offsetWidth || rect0.width;
+      const minLeft = KEEP_VISIBLE - w;
+      const maxLeft = window.innerWidth - KEEP_VISIBLE;
+      const minTop = 0;
+      const maxTop = window.innerHeight - KEEP_VISIBLE;
+      const left = Math.min(maxLeft, Math.max(minLeft, ev.clientX - ox));
+      const top = Math.min(maxTop, Math.max(minTop, ev.clientY - oy));
+      panel.style.left = `${left}px`;
+      panel.style.top = `${top}px`;
       panel.style.right = 'auto';
       panel.style.bottom = 'auto';
     };
@@ -1481,11 +1478,6 @@ function injectStyles(): void {
       --ov-s-pending:        #4ec9b0;
       --ov-scrollbar:        #2a2f37;
       --ov-shadow:           rgba(0,0,0,.6);
-      --ov-fp-bg:            rgba(106,176,255,.08);
-      --ov-fp-fg:            #6ab0ff;
-      --ov-tp-bg:            rgba(181,140,255,.08);
-      --ov-tp-fg:            #b58cff;
-
       position: fixed !important;
       bottom: 20px !important;
       right: 20px !important;
@@ -1535,10 +1527,6 @@ function injectStyles(): void {
       --ov-s-pending:        #1a8473;
       --ov-scrollbar:        #d9d4c4;
       --ov-shadow:           rgba(0,0,0,.15);
-      --ov-fp-bg:            rgba(42,111,219,.07);
-      --ov-fp-fg:            #1f6feb;
-      --ov-tp-bg:            rgba(122,61,240,.07);
-      --ov-tp-fg:            #7a3df0;
     }
 
     /* ── Header ── */
@@ -1995,22 +1983,6 @@ function injectStyles(): void {
       font-weight: 700 !important;
       padding: 2px 0 !important;
     }
-
-    /* ── Domain groups ── */
-    .ov-domain-group { margin: 0 !important; }
-    .ov-domain-header {
-      display: flex !important;
-      justify-content: space-between !important;
-      align-items: center !important;
-      padding: 3px 8px !important;
-      font-size: 9px !important;
-      font-weight: 700 !important;
-      letter-spacing: .04em !important;
-      text-transform: uppercase !important;
-    }
-    .ov-first-party { background: var(--ov-fp-bg) !important; color: var(--ov-fp-fg) !important; }
-    .ov-third-party { background: var(--ov-tp-bg) !important; color: var(--ov-tp-fg) !important; }
-    .ov-domain-count { font-size: 9px !important; opacity: .6 !important; }
 
     /* ── Empty ── */
     .ov-empty {
