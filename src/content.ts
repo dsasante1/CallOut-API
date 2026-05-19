@@ -48,7 +48,9 @@ const MIN_SUBSTRING_LEN = 4;
 
 const requests = new Map<number, ApiRequest>();
 const expandedIds = new Set<number>();
-const badgeTimers = new Map<number, number>();
+const selectorBadges = new Map<string, HTMLDivElement>();
+const selectorReqIds = new Map<string, number[]>();
+const selectorTimers = new Map<string, number>();
 const detailTabs = new Map<number, DetailTab>();
 
 // filter state — multi-select sets (empty = pass-through)
@@ -76,6 +78,7 @@ let dockState: DockState = 'panel';
 let showPinTray = false;
 let ghostHeld = false;
 let ghostTimer: number | null = null;
+let clusterOutsideClickHandler: ((e: MouseEvent) => void) | null = null;
 
 let valueHighlightEls: HTMLElement[] = [];
 let valueHighlightIndex = 0;
@@ -117,14 +120,12 @@ function trimRequests(): void {
   for (let i = 0; i < overflow; i++) {
     const k = iter.next().value as number | undefined;
     if (k === undefined) break;
+    const trimmed = requests.get(k);
     requests.delete(k);
     expandedIds.delete(k);
     detailTabs.delete(k);
     pinnedIds.delete(k);
-    const timer = badgeTimers.get(k);
-    if (timer !== undefined) { clearTimeout(timer); badgeTimers.delete(k); }
-    badges.get(k)?.remove();
-    badges.delete(k);
+    if (trimmed?.element?.selector) removeSelectorReqId(trimmed.element.selector, k);
   }
 }
 
@@ -269,6 +270,7 @@ function applyTheme(theme: 'dark' | 'light'): void {
   if (pill) pill.dataset.theme = theme;
   const btn = $('ov-theme');
   if (btn) btn.textContent = theme === 'dark' ? 'light' : 'dark';
+  for (const b of selectorBadges.values()) b.dataset.theme = theme;
 }
 
 function loadTheme(): Promise<'dark' | 'light'> {
@@ -1327,7 +1329,73 @@ function clearHighlight(): void {
 
 // ── Float badges ──────────────────────────────────────────────────────────────
 
-const badges = new Map<number, HTMLDivElement>();
+function removeSelectorReqId(sel: string, id: number): void {
+  const ids = selectorReqIds.get(sel);
+  if (!ids) return;
+  const next = ids.filter(x => x !== id);
+  if (next.length === 0) {
+    const t = selectorTimers.get(sel);
+    if (t !== undefined) clearTimeout(t);
+    selectorBadges.get(sel)?.remove();
+    selectorBadges.delete(sel);
+    selectorReqIds.delete(sel);
+    selectorTimers.delete(sel);
+  } else {
+    selectorReqIds.set(sel, next);
+    refreshClusterBadge(sel);
+  }
+}
+
+function clusterBadgeRowHtml(req: ApiRequest): string {
+  let path = req.url;
+  try { path = new URL(req.url).pathname; } catch { /* use full url */ }
+  const sc = typeof req.status === 'number' ? String(req.status)[0] : '';
+  const statusHtml = req.status !== 'pending'
+    ? `<span class="ov-fb-s ov-fb-s-${sc}">${escHtml(String(req.status))}</span>`
+    : '<span class="ov-fb-s">…</span>';
+  return `<div class="ov-fb-row"><span class="ov-fb-m ov-fb-m-${safeMethodClass(req.method)}">${escHtml(req.method)}</span><span class="ov-fb-url">${escHtml(path)}</span>${statusHtml}</div>`;
+}
+
+function refreshClusterBadge(sel: string): void {
+  const badge = selectorBadges.get(sel);
+  if (!badge) return;
+  const ids = selectorReqIds.get(sel) ?? [];
+  const count = ids.length;
+  const open = badge.classList.contains('ov-fb-open');
+
+  const countEl = badge.querySelector<HTMLElement>('.ov-fb-circle');
+  const popupEl = badge.querySelector<HTMLElement>('.ov-fb-popup');
+
+  if (!countEl || !popupEl) {
+    // First render — build from scratch
+    const popupHtml = ids.map(id => {
+      const r = requests.get(id);
+      return r ? clusterBadgeRowHtml(r) : '';
+    }).join('');
+    const dir = badge.dataset.popupDir ?? 'right';
+    badge.innerHTML = `<span class="ov-fb-circle">${count}</span><div class="ov-fb-popup ov-fb-popup-${dir}${open ? ' ov-fb-popup-show' : ''}">${popupHtml}</div>`;
+    return;
+  }
+
+  // Surgical updates — avoid full rebuild while popup may be open
+  countEl.textContent = String(count);
+  popupEl.classList.toggle('ov-fb-popup-show', open);
+
+  // Sync rows: add/update without touching unaffected ones
+  const existingRows = Array.from(popupEl.querySelectorAll<HTMLElement>('.ov-fb-row'));
+  for (let i = 0; i < ids.length; i++) {
+    const r = requests.get(ids[i]);
+    if (!r) continue;
+    if (existingRows[i]) {
+      existingRows[i].outerHTML = clusterBadgeRowHtml(r);
+    } else {
+      popupEl.insertAdjacentHTML('beforeend', clusterBadgeRowHtml(r));
+    }
+  }
+  // Remove stale trailing rows
+  const staleRows = Array.from(popupEl.querySelectorAll<HTMLElement>('.ov-fb-row')).slice(ids.length);
+  for (const el of staleRows) el.remove();
+}
 
 function flashBadge(req: ApiRequest): void {
   if (!req.element?.selector) return;
@@ -1336,33 +1404,59 @@ function flashBadge(req: ApiRequest): void {
     if (!el || el.closest('#ov-panel')) return;
     const rect = el.getBoundingClientRect();
     if (!rect.width && !rect.height) return;
-    const key = req.id;
-    const existing = badges.get(key);
-    if (existing) existing.remove();
-    const prevTimer = badgeTimers.get(key);
-    if (prevTimer !== undefined) clearTimeout(prevTimer);
-    const badge = document.createElement('div');
-    badge.className = 'ov-float-badge';
-    let path = req.url;
-    try { path = new URL(req.url).pathname; } catch { /* use full url */ }
-    const sc = typeof req.status === 'number' ? String(req.status)[0] : '';
-    badge.innerHTML = `<span class="ov-fb-m ov-fb-m-${safeMethodClass(req.method)}">${escHtml(req.method)}</span><span class="ov-fb-url">${escHtml(path)}</span>${req.status !== 'pending' ? `<span class="ov-fb-s ov-fb-s-${sc}">${escHtml(String(req.status))}</span>` : ''}`;
-    badge.title = req.url;
-    badge.style.cssText = `top:${window.scrollY + rect.top - 22}px;left:${window.scrollX + rect.left}px;`;
-    document.documentElement.appendChild(badge);
-    badges.set(key, badge);
+    const sel = req.element.selector;
+
+    // Track this request under its selector
+    const ids = selectorReqIds.get(sel) ?? [];
+    if (!ids.includes(req.id)) ids.push(req.id);
+    selectorReqIds.set(sel, ids);
+
+    // Create cluster badge if needed
+    if (!selectorBadges.has(sel)) {
+      const badge = document.createElement('div');
+      badge.className = 'ov-float-badge ov-fb-cluster';
+      badge.dataset.theme = currentTheme;
+      badge.dataset.sel = sel;
+      // Popup opens right unless circle is in the right half — then open left
+      const popupDir = (rect.right - 13) > window.innerWidth / 2 ? 'left' : 'right';
+      badge.dataset.popupDir = popupDir;
+      // Anchor circle to element's top-right corner, clamped inside viewport
+      const cx = Math.min(
+        window.scrollX + rect.right - 13,
+        window.innerWidth - 30
+      );
+      const cy = Math.max(window.scrollY + rect.top - 13, window.scrollY + 4);
+      badge.style.cssText = `top:${cy}px;left:${cx}px;`;
+      document.documentElement.appendChild(badge);
+      selectorBadges.set(sel, badge);
+      badge.addEventListener('click', (e) => {
+        e.stopPropagation();
+        badge.classList.toggle('ov-fb-open');
+        refreshClusterBadge(sel);
+      });
+    }
+
+    refreshClusterBadge(sel);
+
+    // Reset auto-dismiss timer (restarts on each new request for this element)
+    const prev = selectorTimers.get(sel);
+    if (prev !== undefined) clearTimeout(prev);
     const timer = window.setTimeout(() => {
-      badge.remove(); badges.delete(key); badgeTimers.delete(key);
-    }, 5000);
-    badgeTimers.set(key, timer);
+      selectorBadges.get(sel)?.remove();
+      selectorBadges.delete(sel);
+      selectorReqIds.delete(sel);
+      selectorTimers.delete(sel);
+    }, 6000);
+    selectorTimers.set(sel, timer);
   } catch { /* invalid selector */ }
 }
 
 function clearAllBadges(): void {
-  for (const b of badges.values()) b.remove();
-  for (const t of badgeTimers.values()) clearTimeout(t);
-  badges.clear();
-  badgeTimers.clear();
+  for (const b of selectorBadges.values()) b.remove();
+  for (const t of selectorTimers.values()) clearTimeout(t);
+  selectorBadges.clear();
+  selectorReqIds.clear();
+  selectorTimers.clear();
   for (const b of document.querySelectorAll('.ov-float-badge')) b.remove();
 }
 
@@ -2138,25 +2232,110 @@ function injectStyles(): void {
       box-shadow: 0 0 0 5px rgba(255,90,110,.18) !important;
     }
 
-    /* ── Float badges ── */
+    /* ── Float badge cluster button ── */
     .ov-float-badge {
       position: absolute !important;
-      display: inline-flex !important;
-      align-items: center !important;
-      gap: 5px !important;
-      background: #14161a !important;
-      border: 1px solid #2a2f37 !important;
-      font-size: 10px !important;
-      font-family: 'JetBrains Mono','IBM Plex Mono',ui-monospace,monospace !important;
-      padding: 3px 7px !important;
-      border-radius: 3px !important;
       z-index: 2147483645 !important;
       pointer-events: none !important;
-      white-space: nowrap !important;
-      max-width: 280px !important;
-      box-shadow: 0 3px 12px rgba(0,0,0,.5) !important;
-      animation: ov-fadein .15s ease !important;
+      font-family: 'JetBrains Mono','IBM Plex Mono',ui-monospace,monospace !important;
     }
+    .ov-fb-cluster {
+      pointer-events: auto !important;
+    }
+
+    /* dark theme (default) */
+    .ov-fb-cluster .ov-fb-circle {
+      background: #14161a !important;
+      color: #6ab0ff !important;
+      border-color: #2a2f37 !important;
+    }
+    .ov-fb-cluster:hover .ov-fb-circle,
+    .ov-fb-cluster.ov-fb-open .ov-fb-circle {
+      background: #1a1d22 !important;
+      color: #6ab0ff !important;
+      border-color: #6ab0ff !important;
+    }
+    .ov-fb-cluster .ov-fb-popup {
+      background: #14161a !important;
+      border-color: #2a2f37 !important;
+    }
+    .ov-fb-cluster .ov-fb-url { color: #9aa1ab !important; }
+    .ov-fb-cluster .ov-fb-s   { color: #6c727c !important; }
+
+    /* light theme */
+    .ov-fb-cluster[data-theme="light"] .ov-fb-circle {
+      background: #ffffff !important;
+      color: #2a6fdb !important;
+      border-color: #d9d4c4 !important;
+      box-shadow: 0 2px 8px rgba(0,0,0,.18) !important;
+    }
+    .ov-fb-cluster[data-theme="light"]:hover .ov-fb-circle,
+    .ov-fb-cluster[data-theme="light"].ov-fb-open .ov-fb-circle {
+      background: #f3f1ec !important;
+      border-color: #2a6fdb !important;
+    }
+    .ov-fb-cluster[data-theme="light"] .ov-fb-popup {
+      background: #ffffff !important;
+      border-color: #d9d4c4 !important;
+      box-shadow: 0 6px 20px rgba(0,0,0,.15) !important;
+    }
+    .ov-fb-cluster[data-theme="light"] .ov-fb-url { color: #4a4f59 !important; }
+    .ov-fb-cluster[data-theme="light"] .ov-fb-s   { color: #6c727c !important; }
+
+    .ov-fb-circle {
+      display: flex !important;
+      align-items: center !important;
+      justify-content: center !important;
+      width: 26px !important;
+      height: 26px !important;
+      border-radius: 50% !important;
+      font-size: 11px !important;
+      font-weight: 700 !important;
+      cursor: pointer !important;
+      box-shadow: 0 2px 8px rgba(0,0,0,.45) !important;
+      border: 1.5px solid !important;
+      user-select: none !important;
+      animation: ov-fadein .15s ease !important;
+      transition: background .12s, border-color .12s, transform .1s !important;
+    }
+    .ov-fb-cluster:hover .ov-fb-circle {
+      transform: scale(1.1) !important;
+    }
+
+    /* popup panel — opens to the right of the circle */
+    .ov-fb-popup {
+      display: none !important;
+      position: absolute !important;
+      top: -4px !important;
+      min-width: 230px !important;
+      max-width: 340px !important;
+      border-radius: 6px !important;
+      box-shadow: 0 6px 20px rgba(0,0,0,.5) !important;
+      padding: 4px 0 !important;
+      animation: ov-fadein .12s ease !important;
+      z-index: 2147483646 !important;
+      border: 1px solid !important;
+    }
+    /* default: open to the right of the circle */
+    .ov-fb-popup-right { left: 32px !important; right: auto !important; }
+    /* flip: open to the left when circle is in the right half of the viewport */
+    .ov-fb-popup-left  { right: 32px !important; left: auto !important; }
+    .ov-fb-popup-show {
+      display: block !important;
+    }
+    .ov-fb-row {
+      display: flex !important;
+      align-items: center !important;
+      gap: 5px !important;
+      padding: 5px 10px !important;
+      white-space: nowrap !important;
+      overflow: hidden !important;
+      border-bottom: 1px solid #1e2229 !important;
+    }
+    .ov-fb-cluster[data-theme="light"] .ov-fb-row {
+      border-bottom-color: #ebe6d8 !important;
+    }
+    .ov-fb-row:last-child { border-bottom: none !important; }
     .ov-fb-m {
       font-weight: 700 !important;
       font-size: 9px !important;
@@ -2173,16 +2352,16 @@ function injectStyles(): void {
     .ov-fb-m-delete { background: #d23158 !important; }
     .ov-fb-m-ws     { background: #1a8473 !important; }
     .ov-fb-url {
-      color: #9aa1ab !important;
+      font-size: 10px !important;
       overflow: hidden !important;
       text-overflow: ellipsis !important;
-      max-width: 180px !important;
-      flex-shrink: 1 !important;
+      flex: 1 1 0 !important;
+      min-width: 0 !important;
     }
     .ov-fb-s {
       font-weight: 700 !important;
+      font-size: 10px !important;
       flex-shrink: 0 !important;
-      color: #6c727c !important;
     }
     .ov-fb-s-2 { color: #4ec9b0 !important; }
     .ov-fb-s-4 { color: #d4a85e !important; }
@@ -2281,6 +2460,18 @@ if (dockState === 'pill') buildPill();
     });
   };
 
+  clusterOutsideClickHandler = (e: MouseEvent) => {
+    const target = e.target as Element | null;
+    for (const badge of selectorBadges.values()) {
+      if (!badge.classList.contains('ov-fb-open')) continue;
+      if (!badge.contains(target)) {
+        badge.classList.remove('ov-fb-open');
+        refreshClusterBadge(badge.dataset.sel ?? '');
+      }
+    }
+  };
+  document.addEventListener('click', clusterOutsideClickHandler, true);
+
   if (document.body) init();
   else document.addEventListener('DOMContentLoaded', init, { once: true });
 }
@@ -2289,6 +2480,10 @@ function deactivateOverlay(): void {
   if (!activated) return;
   activated = false;
   rowEventsBound = false;
+  if (clusterOutsideClickHandler) {
+    document.removeEventListener('click', clusterOutsideClickHandler, true);
+    clusterOutsideClickHandler = null;
+  }
   signalInjected('stop');
   cancelScheduledRender();
   document.getElementById('ov-panel')?.remove();
