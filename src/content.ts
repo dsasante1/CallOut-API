@@ -1390,10 +1390,10 @@ function makeDraggable(panel: HTMLElement, handle: HTMLElement): void {
       const maxTop = window.innerHeight - KEEP_VISIBLE;
       const left = Math.min(maxLeft, Math.max(minLeft, ev.clientX - ox));
       const top = Math.min(maxTop, Math.max(minTop, ev.clientY - oy));
-      panel.style.left = `${left}px`;
-      panel.style.top = `${top}px`;
-      panel.style.right = 'auto';
-      panel.style.bottom = 'auto';
+      panel.style.setProperty('left', `${left}px`, 'important');
+      panel.style.setProperty('top', `${top}px`, 'important');
+      panel.style.setProperty('right', 'auto', 'important');
+      panel.style.setProperty('bottom', 'auto', 'important');
     };
     const up = () => {
       document.removeEventListener('mousemove', move);
