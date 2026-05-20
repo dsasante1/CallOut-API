@@ -40,7 +40,6 @@ const MAX_WS_MESSAGES_PER_CONN = 500;
 const WS_TRIM_TRIGGER = MAX_WS_MESSAGES_PER_CONN + 50;
 const RENDER_LIMIT = 200;
 const RENDER_THROTTLE_MS = 100;
-const MAX_JSON_RENDER_CHARS = 4000;
 const MAX_JSON_LEAF_LEN = 1000;
 const MAX_VALUE_HIGHLIGHTS = 50;
 const MIN_VALUE_LEN = 2;
@@ -393,73 +392,177 @@ function collectJsonLeaves(root: unknown, out: Array<{value: string; kind: strin
   walk(root);
 }
 
-interface JsonRenderState { chars: number; truncated: boolean }
+// Each rendered JSON line is a JsonRow: a depth + an ordered list of segments.
+// Segments are either inert HTML (keys, brackets, commas) or interactive value
+// leaves (the .ov-jv spans the click handler needs to find).
+type JsonLeafKind = 'string' | 'number' | 'boolean' | 'null';
+interface JsonLeafSeg { kind: 'leaf'; vkind: JsonLeafKind; display: string; raw: string }
+interface JsonTextSeg { kind: 'text'; html: string }
+type JsonSeg = JsonLeafSeg | JsonTextSeg;
+interface JsonRow { depth: number; segs: JsonSeg[] }
 
-function renderJsonHtml(value: unknown): string {
-  const out: string[] = [];
-  const st: JsonRenderState = { chars: 0, truncated: false };
-  renderJsonNode(value, '', st, out);
-  if (st.truncated) out.push('\n<span class="ov-jv-trunc">… truncated</span>');
-  return out.join('');
+function flattenJsonRows(value: unknown): JsonRow[] {
+  const rows: JsonRow[] = [];
+  const leafSeg = (vkind: JsonLeafKind, display: string, raw: string): JsonLeafSeg =>
+    ({ kind: 'leaf', vkind, display, raw });
+  const textSeg = (html: string): JsonTextSeg => ({ kind: 'text', html });
+  const commaSeg = (trailing: boolean): JsonSeg[] => trailing ? [textSeg(',')] : [];
+  const keySeg = (k: string | null): JsonSeg[] =>
+    k === null ? [] : [textSeg(`<span class="ov-jk">"${escHtml(k)}"</span>: `)];
+
+  function walk(v: unknown, depth: number, key: string | null, trailing: boolean): void {
+    if (v === null) {
+      rows.push({ depth, segs: [...keySeg(key), leafSeg('null', 'null', 'null'), ...commaSeg(trailing)] });
+      return;
+    }
+    const t = typeof v;
+    if (t === 'string') {
+      const s = v as string;
+      const cut = s.length > MAX_JSON_LEAF_LEN ? s.slice(0, MAX_JSON_LEAF_LEN) : s;
+      const ell = cut.length < s.length ? '…' : '';
+      rows.push({ depth, segs: [...keySeg(key), leafSeg('string', `"${escHtml(cut)}${ell}"`, cut), ...commaSeg(trailing)] });
+      return;
+    }
+    if (t === 'number' || t === 'boolean') {
+      const display = String(v);
+      rows.push({ depth, segs: [...keySeg(key), leafSeg(t as JsonLeafKind, display, display), ...commaSeg(trailing)] });
+      return;
+    }
+    if (Array.isArray(v)) {
+      if (v.length === 0) {
+        rows.push({ depth, segs: [...keySeg(key), textSeg('[]'), ...commaSeg(trailing)] });
+        return;
+      }
+      rows.push({ depth, segs: [...keySeg(key), textSeg('[')] });
+      for (let i = 0; i < v.length; i++) walk(v[i], depth + 1, null, i < v.length - 1);
+      rows.push({ depth, segs: [textSeg(']'), ...commaSeg(trailing)] });
+      return;
+    }
+    if (t === 'object') {
+      const obj = v as Record<string, unknown>;
+      const keys = Object.keys(obj);
+      if (keys.length === 0) {
+        rows.push({ depth, segs: [...keySeg(key), textSeg('{}'), ...commaSeg(trailing)] });
+        return;
+      }
+      rows.push({ depth, segs: [...keySeg(key), textSeg('{')] });
+      for (let i = 0; i < keys.length; i++) walk(obj[keys[i]], depth + 1, keys[i], i < keys.length - 1);
+      rows.push({ depth, segs: [textSeg('}'), ...commaSeg(trailing)] });
+      return;
+    }
+    try {
+      const fallback = JSON.stringify(v);
+      if (fallback !== undefined) rows.push({ depth, segs: [...keySeg(key), textSeg(escHtml(fallback)), ...commaSeg(trailing)] });
+    } catch { /* skip */ }
+  }
+  walk(value, 0, null, false);
+  return rows;
 }
 
-function renderJsonNode(v: unknown, indent: string, st: JsonRenderState, out: string[]): void {
-  if (st.chars > MAX_JSON_RENDER_CHARS) { st.truncated = true; return; }
-  if (v === null) { writeJsonLeaf(out, st, 'null', 'null', 'null'); return; }
-  const t = typeof v;
-  if (t === 'string') {
-    const s = v as string;
-    const trimmed = s.length > MAX_JSON_LEAF_LEN ? s.slice(0, MAX_JSON_LEAF_LEN) : s;
-    const ell = trimmed.length < s.length ? '…' : '';
-    writeJsonLeaf(out, st, `"${escHtml(trimmed)}${ell}"`, 'string', trimmed);
-    return;
+function jsonRowToHtml(row: JsonRow, activeKey: string): string {
+  let out = '  '.repeat(row.depth);
+  for (const seg of row.segs) {
+    if (seg.kind === 'text') { out += seg.html; continue; }
+    const enc = encodeURIComponent(seg.raw);
+    const isActive = activeKey && activeKey.endsWith(`|${seg.vkind}|${enc}`);
+    out += `<span class="ov-jv ov-jv-${seg.vkind}${isActive ? ' ov-jv-active' : ''}" data-ov-val="${enc}" data-ov-kind="${seg.vkind}">${seg.display}</span>`;
   }
-  if (t === 'number' || t === 'boolean') {
-    const display = String(v);
-    writeJsonLeaf(out, st, display, t, display);
-    return;
-  }
-  if (Array.isArray(v)) {
-    if (v.length === 0) { out.push('[]'); st.chars += 2; return; }
-    out.push('[\n'); st.chars += 2;
-    const inner = `${indent}  `;
-    for (let i = 0; i < v.length; i++) {
-      if (st.chars > MAX_JSON_RENDER_CHARS) { st.truncated = true; break; }
-      out.push(inner); st.chars += inner.length;
-      renderJsonNode(v[i], inner, st, out);
-      if (i < v.length - 1) { out.push(','); st.chars += 1; }
-      out.push('\n'); st.chars += 1;
-    }
-    out.push(`${indent}]`); st.chars += indent.length + 1;
-    return;
-  }
-  if (t === 'object') {
-    const obj = v as Record<string, unknown>;
-    const keys = Object.keys(obj);
-    if (keys.length === 0) { out.push('{}'); st.chars += 2; return; }
-    out.push('{\n'); st.chars += 2;
-    const inner = `${indent}  `;
-    for (let i = 0; i < keys.length; i++) {
-      if (st.chars > MAX_JSON_RENDER_CHARS) { st.truncated = true; break; }
-      const k = keys[i];
-      out.push(`${inner}<span class="ov-jk">"${escHtml(k)}"</span>: `);
-      st.chars += inner.length + k.length + 4;
-      renderJsonNode(obj[k], inner, st, out);
-      if (i < keys.length - 1) { out.push(','); st.chars += 1; }
-      out.push('\n'); st.chars += 1;
-    }
-    out.push(`${indent}}`); st.chars += indent.length + 1;
-    return;
-  }
-  try {
-    const fallback = JSON.stringify(v);
-    if (fallback !== undefined) { out.push(escHtml(fallback)); st.chars += fallback.length; }
-  } catch { /* skip */ }
+  return out;
 }
 
-function writeJsonLeaf(out: string[], st: JsonRenderState, display: string, kind: string, raw: string): void {
-  out.push(`<span class="ov-jv ov-jv-${kind}" data-ov-val="${encodeURIComponent(raw)}" data-ov-kind="${kind}">${display}</span>`);
-  st.chars += display.length;
+interface JvVirt {
+  host: HTMLElement;
+  reqId: number;
+  rows: JsonRow[];
+  render: () => void;
+  destroy: () => void;
+  scrollToRow: (idx: number) => void;
+  findRowIdx: (vkind: string, encVal: string) => number;
+}
+
+const JSON_LINE_HEIGHT = 14;
+const JSON_VIEW_OVERSCAN = 8;
+const JSON_VIEW_PAD = 6;
+// Keyed by host element so duplicate placeholders for the same request (e.g.
+// a row that appears in both the main list and the pin tray) each get their
+// own mount and their own scroll listener cleanup.
+const jvVirtMounts = new Map<HTMLElement, JvVirt>();
+const jvScrollByReq = new Map<number, number>();
+
+function captureJvScrollState(): void {
+  for (const v of jvVirtMounts.values()) jvScrollByReq.set(v.reqId, v.host.scrollTop);
+}
+
+function destroyAllJvVirt(): void {
+  for (const v of jvVirtMounts.values()) v.destroy();
+  jvVirtMounts.clear();
+}
+
+function findJvVirtByReqId(id: number): JvVirt | undefined {
+  for (const v of jvVirtMounts.values()) if (v.reqId === id) return v;
+  return undefined;
+}
+
+function mountJsonVirtualizer(host: HTMLElement, rows: JsonRow[], reqId: number): JvVirt {
+  const total = rows.length;
+  const spacerH = total * JSON_LINE_HEIGHT + JSON_VIEW_PAD * 2;
+  host.classList.add('ov-jv-virt');
+  host.innerHTML = `<div class="ov-jv-spacer" style="height:${spacerH}px"></div><div class="ov-jv-window"></div>`;
+  const winEl = host.querySelector<HTMLElement>('.ov-jv-window');
+  if (!winEl) {
+    return {
+      host, reqId, rows,
+      render() { /* no-op */ },
+      destroy() { /* no-op */ },
+      scrollToRow() { /* no-op */ },
+      findRowIdx() { return -1; }
+    };
+  }
+  const win: HTMLElement = winEl;
+
+  let lastStart = -1, lastEnd = -1;
+  function render(): void {
+    const scrollTop = host.scrollTop;
+    const hostH = host.clientHeight || 220;
+    const visStart = Math.max(0, Math.floor((scrollTop - JSON_VIEW_PAD) / JSON_LINE_HEIGHT) - JSON_VIEW_OVERSCAN);
+    const visEnd = Math.min(total, Math.ceil((scrollTop + hostH - JSON_VIEW_PAD) / JSON_LINE_HEIGHT) + JSON_VIEW_OVERSCAN);
+    if (visStart === lastStart && visEnd === lastEnd) return;
+    lastStart = visStart; lastEnd = visEnd;
+    win.style.transform = `translateY(${JSON_VIEW_PAD + visStart * JSON_LINE_HEIGHT}px)`;
+    const parts: string[] = [];
+    for (let i = visStart; i < visEnd; i++) {
+      parts.push(`<div class="ov-jv-line">${jsonRowToHtml(rows[i], valueHighlightKey)}</div>`);
+    }
+    win.innerHTML = parts.join('');
+  }
+
+  host.addEventListener('scroll', render, { passive: true });
+  const initial = jvScrollByReq.get(reqId) ?? 0;
+  host.scrollTop = Math.min(initial, Math.max(0, spacerH - host.clientHeight));
+  render();
+
+  return {
+    host, reqId, rows,
+    render,
+    destroy() {
+      host.removeEventListener('scroll', render);
+      host.classList.remove('ov-jv-virt');
+    },
+    scrollToRow(idx: number) {
+      const target = idx * JSON_LINE_HEIGHT - Math.max(0, host.clientHeight - JSON_LINE_HEIGHT) / 2;
+      host.scrollTop = Math.max(0, target);
+      lastStart = -1; lastEnd = -1;
+      render();
+    },
+    findRowIdx(vkind: string, encVal: string): number {
+      for (let i = 0; i < rows.length; i++) {
+        for (const s of rows[i].segs) {
+          if (s.kind === 'leaf' && s.vkind === vkind && encodeURIComponent(s.raw) === encVal) return i;
+        }
+      }
+      return -1;
+    }
+  };
 }
 
 // ── DOM value search / highlight ──────────────────────────────────────────────
@@ -634,7 +737,11 @@ function setValueStatusBadge(jv: HTMLElement, total: number, index: number): voi
   else if (total === 1) el.textContent = '1 match';
   else el.textContent = `${index + 1}/${total} · click to cycle`;
   el.dataset.empty = total === 0 ? '1' : '';
-  jv.after(el);
+  // Anchor the badge to the JSON host instead of next to jv. The virtualizer
+  // recycles .ov-jv spans on scroll, which would orphan an inline badge.
+  const host = jv.closest<HTMLElement>('.ov-body-json');
+  if (host?.parentElement) host.parentElement.insertBefore(el, host.nextSibling);
+  else jv.after(el);
 }
 
 function handleJsonValueClick(jv: HTMLElement): void {
@@ -666,9 +773,27 @@ function reattachValueHighlight(): void {
   if (!valueHighlightKey) return;
   const parts = valueHighlightKey.split('|');
   if (parts.length < 3) return;
-  const [rowId, kind, encVal] = parts;
+  const [rowIdStr, kind, encVal] = parts;
+  const rowId = Number(rowIdStr);
+
+  // Virtualized path: target row may not be in the DOM window. Scroll the
+  // virtualizer to bring it in, then look up the (now rendered) span.
+  const v = findJvVirtByReqId(rowId);
+  if (v) {
+    const idx = v.findRowIdx(kind, encVal);
+    if (idx < 0) { clearValueHighlights(); return; }
+    const lineTop = JSON_VIEW_PAD + idx * JSON_LINE_HEIGHT;
+    const viewTop = v.host.scrollTop;
+    const viewBot = viewTop + v.host.clientHeight;
+    if (lineTop < viewTop || lineTop + JSON_LINE_HEIGHT > viewBot) v.scrollToRow(idx);
+    const span = v.host.querySelector<HTMLElement>(`.ov-jv[data-ov-kind="${kind}"][data-ov-val="${encVal}"]`);
+    if (span) setValueStatusBadge(span, valueHighlightEls.length, valueHighlightIndex);
+    return;
+  }
+
+  // Non-virtualized path (kept as a fallback, e.g. plain-text or empty bodies).
   const span = document.querySelector<HTMLElement>(
-    `#ov-list .ov-row[data-id="${rowId}"] .ov-jv[data-ov-kind="${kind}"][data-ov-val="${encVal}"]`
+    `#ov-list .ov-row[data-id="${rowIdStr}"] .ov-jv[data-ov-kind="${kind}"][data-ov-val="${encVal}"]`
   );
   if (!span) { clearValueHighlights(); return; }
   span.classList.add('ov-jv-active');
@@ -708,7 +833,7 @@ function detailPanelHtml(req: ApiRequest): string {
     if (req.resBody != null) {
       const parsed = tryParseJsonContainer(req.resBody);
       resBodyHtml = parsed !== undefined
-        ? `<div class="ov-body-json">${renderJsonHtml(parsed)}</div>`
+        ? `<div class="ov-body-json" data-id="${req.id}"></div>`
         : `<pre class="ov-body-pre">${escHtml(formatBody(req.resBody).slice(0, 3000))}</pre>`;
     } else if (req.status === 'pending') {
       resBodyHtml = '<div class="ov-body-none">Waiting…</div>';
@@ -935,7 +1060,24 @@ function renderList(): void {
     html += visible.map(r => rowHtml(r)).join('');
   }
 
+  // Snapshot scroll positions of currently mounted JSON virtualizers, then tear
+  // them down — innerHTML below will detach their DOM hosts.
+  captureJvScrollState();
+  destroyAllJvVirt();
+
   list.innerHTML = html;
+
+  // Mount a virtualizer for every visible JSON response placeholder.
+  for (const host of list.querySelectorAll<HTMLElement>('.ov-body-json[data-id]')) {
+    const id = Number(host.dataset.id);
+    const req = requests.get(id);
+    if (!req?.resBody) continue;
+    const parsed = tryParseJsonContainer(req.resBody);
+    if (parsed === undefined) continue;
+    const rows = flattenJsonRows(parsed);
+    jvVirtMounts.set(host, mountJsonVirtualizer(host, rows, id));
+  }
+
   reattachValueHighlight();
   renderFooter();
 }
@@ -2031,7 +2173,27 @@ function injectStyles(): void {
       max-height: 220px !important;
       overflow-y: auto !important;
     }
-    .ov-body-json::-webkit-scrollbar { width: 8px !important; }
+    .ov-body-json.ov-jv-virt {
+      position: relative !important;
+      padding: 0 !important;
+      overflow: auto !important;
+      white-space: normal !important;
+      word-break: normal !important;
+      contain: strict !important;
+      height: 220px !important;
+    }
+    .ov-jv-spacer { width: 1px !important; pointer-events: none !important; visibility: hidden !important; }
+    .ov-jv-window { position: absolute !important; top: 0 !important; left: 0 !important; right: 0 !important; will-change: transform !important; }
+    .ov-jv-line {
+      display: block !important;
+      height: 14px !important;
+      line-height: 14px !important;
+      padding: 0 8px !important;
+      white-space: pre !important;
+      overflow: visible !important;
+      font-family: inherit !important;
+    }
+    .ov-body-json::-webkit-scrollbar { width: 8px !important; height: 8px !important; }
     .ov-body-json::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; }
     .ov-jk { color: var(--ov-accent) !important; }
     .ov-jv { cursor: pointer !important; border-radius: 1px !important; padding: 0 1px !important; transition: background .1s !important; }
