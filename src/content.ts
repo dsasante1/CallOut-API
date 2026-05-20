@@ -1362,13 +1362,30 @@ function refreshClusterBadge(sel: string): void {
   if (!badge) return;
   const ids = selectorReqIds.get(sel) ?? [];
   const count = ids.length;
-  const open = badge.classList.contains('ov-fb-open');
 
+  if (count === 1) {
+    // Single endpoint — show inline, no circle, no popup
+    const r = requests.get(ids[0]);
+    if (!r) return;
+    badge.className = 'ov-float-badge ov-fb-single';
+    badge.dataset.theme = currentTheme;
+    badge.classList.remove('ov-fb-open');
+    badge.innerHTML = clusterBadgeRowHtml(r);
+    return;
+  }
+
+  // Multi-endpoint cluster — upgrade class if coming from single mode
+  if (!badge.classList.contains('ov-fb-cluster')) {
+    badge.className = 'ov-float-badge ov-fb-cluster';
+    badge.dataset.theme = currentTheme;
+  }
+
+  const open = badge.classList.contains('ov-fb-open');
   const countEl = badge.querySelector<HTMLElement>('.ov-fb-circle');
   const popupEl = badge.querySelector<HTMLElement>('.ov-fb-popup');
 
   if (!countEl || !popupEl) {
-    // First render — build from scratch
+    // First render or upgrade from single — build from scratch
     const popupHtml = ids.map(id => {
       const r = requests.get(id);
       return r ? clusterBadgeRowHtml(r) : '';
@@ -2282,6 +2299,26 @@ function injectStyles(): void {
     }
     .ov-fb-cluster[data-theme="light"] .ov-fb-url { color: #4a4f59 !important; }
     .ov-fb-cluster[data-theme="light"] .ov-fb-s   { color: #6c727c !important; }
+
+    /* Single-endpoint inline badge */
+    .ov-fb-single {
+      pointer-events: none !important;
+      background: #14161a !important;
+      border: 1px solid #2a2f37 !important;
+      border-radius: 4px !important;
+      box-shadow: 0 2px 8px rgba(0,0,0,.45) !important;
+      animation: ov-fadein .15s ease !important;
+    }
+    .ov-fb-single .ov-fb-row { border-bottom: none !important; }
+    .ov-fb-single .ov-fb-url { color: #9aa1ab !important; }
+    .ov-fb-single .ov-fb-s   { color: #6c727c !important; }
+    .ov-fb-single[data-theme="light"] {
+      background: #ffffff !important;
+      border-color: #d9d4c4 !important;
+      box-shadow: 0 2px 8px rgba(0,0,0,.18) !important;
+    }
+    .ov-fb-single[data-theme="light"] .ov-fb-url { color: #4a4f59 !important; }
+    .ov-fb-single[data-theme="light"] .ov-fb-s   { color: #6c727c !important; }
 
     .ov-fb-circle {
       display: flex !important;
