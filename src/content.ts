@@ -839,11 +839,12 @@ function renderFooter(): void {
 
 function renderList(): void {
   if (!activated) return;
+
+  if (dockState === 'pill') { refreshPill(); return; }
+
   const list = $('ov-list');
   const countEl = $('ov-count');
   if (!list) return;
-
-  if (dockState === 'pill') { refreshPill(); return; }
 
   if (cspBlocked) {
     list.innerHTML = `<div class="ov-empty" style="color:var(--ov-s-err)">
