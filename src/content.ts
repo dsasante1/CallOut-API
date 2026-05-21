@@ -820,9 +820,15 @@ function detailPanelHtml(req: ApiRequest): string {
   const activeTab: DetailTab = detailTabs.get(req.id) ?? (isWs ? 'frames' : 'response');
   const tabs: DetailTab[] = isWs ? ['frames', 'headers', 'request'] : ['response', 'request', 'headers', 'timing'];
 
+  const hasResBody = req.resBody != null;
+  const copyResBtn = (activeTab === 'response' && hasResBody)
+    ? `<button class="ov-copy-res-btn" data-id="${req.id}" title="Copy response body">copy res</button>`
+    : '';
+
   const tabsHtml = `<div class="ov-tabs" data-id="${req.id}">
     ${tabs.map(t => `<button class="ov-tab${activeTab === t ? ' ov-tab-active' : ''}" data-tab="${t}">${t}</button>`).join('')}
     <div class="ov-tab-spacer"></div>
+    ${copyResBtn}
     <button class="ov-copy-btn" data-url="${encodeURIComponent(req.url || '')}">copy curl</button>
   </div>`;
 
@@ -1139,6 +1145,24 @@ function bindListDelegation(list: HTMLElement): void {
       }
       chrome.storage.local.set({ ovPinnedKeys: [...pinnedKeys] });
       scheduleRender();
+      return;
+    }
+
+    const copyResBtn = target.closest<HTMLElement>('.ov-copy-res-btn');
+    if (copyResBtn) {
+      e.stopPropagation();
+      const id = Number(copyResBtn.dataset.id);
+      const req = requests.get(id);
+      const body = req?.resBody ?? '';
+      const restore = (label: string) => {
+        copyResBtn.textContent = label;
+        setTimeout(() => { copyResBtn.textContent = 'copy res'; }, 900);
+      };
+      if (navigator.clipboard?.writeText) {
+        navigator.clipboard.writeText(body).then(() => restore('copied!'), () => restore('failed'));
+      } else {
+        restore('failed');
+      }
       return;
     }
 
@@ -2060,7 +2084,7 @@ function injectStyles(): void {
     }
     .ov-row:hover .ov-c-act,
     .ov-row.ov-pinned .ov-c-act { opacity: 1 !important; }
-    .ov-pin-btn, .ov-copy-btn {
+    .ov-pin-btn, .ov-copy-btn, .ov-copy-res-btn {
       all: unset !important;
       cursor: pointer !important;
       font-size: 9px !important;
@@ -2069,7 +2093,7 @@ function injectStyles(): void {
       padding: 1px 4px !important;
       border-radius: 2px !important;
     }
-    .ov-pin-btn:hover, .ov-copy-btn:hover { background: var(--ov-bg-3) !important; color: var(--ov-text) !important; }
+    .ov-pin-btn:hover, .ov-copy-btn:hover, .ov-copy-res-btn:hover { background: var(--ov-bg-3) !important; color: var(--ov-text) !important; }
     .ov-pin-btn.on { color: var(--ov-m-patch) !important; }
 
     /* ── Detail panel ── */
