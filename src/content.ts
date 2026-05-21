@@ -35,6 +35,10 @@ interface OverlayMessage extends Partial<ApiRequest> {
 }
 
 
+const TIMING_DNS_MS = 12;
+const TIMING_TCP_MS = 28;
+const TIMING_DL_MS  = 20;
+
 const MAX_REQUESTS = 1000;
 const MAX_WS_MESSAGES_PER_CONN = 500;
 const WS_TRIM_TRIGGER = MAX_WS_MESSAGES_PER_CONN + 50;
@@ -820,15 +824,21 @@ function detailPanelHtml(req: ApiRequest): string {
   const activeTab: DetailTab = detailTabs.get(req.id) ?? (isWs ? 'frames' : 'response');
   const tabs: DetailTab[] = isWs ? ['frames', 'headers', 'request'] : ['response', 'request', 'headers', 'timing'];
 
-  const hasResBody = req.resBody != null;
-  const copyResBtn = (activeTab === 'response' && hasResBody)
-    ? `<button class="ov-copy-res-btn" data-id="${req.id}" title="Copy response body">copy res</button>`
+  const tabIsCopyable = (
+    (activeTab === 'response' && req.resBody != null) ||
+    (activeTab === 'request' && req.reqBody != null) ||
+    (activeTab === 'headers' && ((req.reqHeaders?.length ?? 0) > 0 || (req.resHeaders?.length ?? 0) > 0)) ||
+    (activeTab === 'timing' && req.ms != null) ||
+    (activeTab === 'frames' && (req.messages?.length ?? 0) > 0)
+  );
+  const copyTabBtn = tabIsCopyable
+    ? `<button class="ov-copy-tab-btn" data-id="${req.id}" data-tab="${activeTab}" title="Copy ${activeTab}">copy</button>`
     : '';
 
   const tabsHtml = `<div class="ov-tabs" data-id="${req.id}">
     ${tabs.map(t => `<button class="ov-tab${activeTab === t ? ' ov-tab-active' : ''}" data-tab="${t}">${t}</button>`).join('')}
     <div class="ov-tab-spacer"></div>
-    ${copyResBtn}
+    ${copyTabBtn}
     <button class="ov-copy-btn" data-url="${encodeURIComponent(req.url || '')}">copy curl</button>
   </div>`;
 
@@ -863,13 +873,12 @@ function detailPanelHtml(req: ApiRequest): string {
 
   } else if (activeTab === 'timing') {
     const total = req.ms ?? 0;
-    const dns = 12, tcp = 28, dl = 20;
-    const ttfb = Math.max(0, total - dns - tcp - dl);
+    const ttfb = Math.max(0, total - TIMING_DNS_MS - TIMING_TCP_MS - TIMING_DL_MS);
     paneHtml = `<div class="ov-panel"><div class="ov-kv">
-      <div class="ov-kv-k">DNS</div><div class="ov-kv-v">${dns}ms</div>
-      <div class="ov-kv-k">TCP</div><div class="ov-kv-v">${tcp}ms</div>
+      <div class="ov-kv-k">DNS</div><div class="ov-kv-v">${TIMING_DNS_MS}ms</div>
+      <div class="ov-kv-k">TCP</div><div class="ov-kv-v">${TIMING_TCP_MS}ms</div>
       <div class="ov-kv-k">TTFB</div><div class="ov-kv-v">${ttfb}ms</div>
-      <div class="ov-kv-k">Download</div><div class="ov-kv-v">${dl}ms</div>
+      <div class="ov-kv-k">Download</div><div class="ov-kv-v">${TIMING_DL_MS}ms</div>
       <div class="ov-kv-k">Total</div><div class="ov-kv-v">${total}ms</div>
     </div></div>`;
 
@@ -1148,18 +1157,37 @@ function bindListDelegation(list: HTMLElement): void {
       return;
     }
 
-    const copyResBtn = target.closest<HTMLElement>('.ov-copy-res-btn');
-    if (copyResBtn) {
+    const copyTabBtn = target.closest<HTMLElement>('.ov-copy-tab-btn');
+    if (copyTabBtn) {
       e.stopPropagation();
-      const id = Number(copyResBtn.dataset.id);
+      const id = Number(copyTabBtn.dataset.id);
+      if (!Number.isFinite(id)) return;
+      const tab = copyTabBtn.dataset.tab as DetailTab;
       const req = requests.get(id);
-      const body = req?.resBody ?? '';
+      let text = '';
+      if (req) {
+        if (tab === 'response') {
+          text = req.resBody ?? '';
+        } else if (tab === 'request') {
+          text = req.reqBody ?? '';
+        } else if (tab === 'headers') {
+          const fmt = (pairs: HeaderPair[] | null | undefined) =>
+            (pairs ?? []).map(([n, v]) => `${n}: ${v}`).join('\n');
+          text = `-- Request --\n${fmt(req.reqHeaders)}\n\n-- Response --\n${fmt(req.resHeaders)}`;
+        } else if (tab === 'timing') {
+          const total = req.ms ?? 0;
+          const ttfb = Math.max(0, total - TIMING_DNS_MS - TIMING_TCP_MS - TIMING_DL_MS);
+          text = `DNS: ${TIMING_DNS_MS}ms\nTCP: ${TIMING_TCP_MS}ms\nTTFB: ${ttfb}ms\nDownload: ${TIMING_DL_MS}ms\nTotal: ${total}ms`;
+        } else if (tab === 'frames') {
+          text = (req.messages ?? []).slice(-100).map(m => `[${m.dir} +${m.ts}ms] ${m.body}`).join('\n');
+        }
+      }
       const restore = (label: string) => {
-        copyResBtn.textContent = label;
-        setTimeout(() => { copyResBtn.textContent = 'copy res'; }, 900);
+        copyTabBtn.textContent = label;
+        setTimeout(() => { copyTabBtn.textContent = 'copy'; }, 900);
       };
       if (navigator.clipboard?.writeText) {
-        navigator.clipboard.writeText(body).then(() => restore('copied!'), () => restore('failed'));
+        navigator.clipboard.writeText(text).then(() => restore('copied!'), () => restore('failed'));
       } else {
         restore('failed');
       }
@@ -1520,7 +1548,7 @@ function clusterBadgeRowHtml(req: ApiRequest): string {
   const statusHtml = req.status !== 'pending'
     ? `<span class="ov-fb-s ov-fb-s-${sc}">${escHtml(String(req.status))}</span>`
     : '<span class="ov-fb-s">…</span>';
-  return `<div class="ov-fb-row"><span class="ov-fb-m ov-fb-m-${safeMethodClass(req.method)}">${escHtml(req.method)}</span><span class="ov-fb-url">${escHtml(path)}</span>${statusHtml}</div>`;
+  return `<div class="ov-fb-row" data-id="${req.id}"><span class="ov-fb-m ov-fb-m-${safeMethodClass(req.method)}">${escHtml(req.method)}</span><span class="ov-fb-url">${escHtml(path)}</span>${statusHtml}</div>`;
 }
 
 function refreshClusterBadge(sel: string): void {
@@ -1581,6 +1609,30 @@ function refreshClusterBadge(sel: string): void {
   for (const el of staleRows) el.remove();
 }
 
+function navigateToRequest(id: number): void {
+  if (!panelVisible) {
+    panelVisible = true;
+    chrome.storage.local.set({ ovVisible: true });
+  }
+  // Track whether the panel already exists; if not, setDockState → buildPanel
+  // will call renderList() internally, so we skip the redundant call below.
+  const panelExisted = !!$('ov-panel');
+  if (dockState !== 'panel') {
+    setDockState('panel');
+  } else {
+    $('ov-panel')?.style.setProperty('display', 'flex', 'important');
+  }
+  if (!expandedIds.has(id)) {
+    expandedIds.add(id);
+    if ((detailTabs.get(id) ?? 'response') === 'response') runBulkHighlight(id);
+  }
+  if (panelExisted) renderList();
+  requestAnimationFrame(() => {
+    document.querySelector<HTMLElement>(`#ov-list .ov-row[data-id="${id}"]`)
+      ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  });
+}
+
 function flashBadge(req: ApiRequest): void {
   if (!req.element?.selector) return;
   try {
@@ -1615,6 +1667,13 @@ function flashBadge(req: ApiRequest): void {
       selectorBadges.set(sel, badge);
       badge.addEventListener('click', (e) => {
         e.stopPropagation();
+        const row = (e.target as Element).closest<HTMLElement>('.ov-fb-row');
+        if (row?.dataset.id) {
+          navigateToRequest(Number(row.dataset.id));
+          badge.classList.remove('ov-fb-open');
+          refreshClusterBadge(sel);
+          return;
+        }
         badge.classList.toggle('ov-fb-open');
         refreshClusterBadge(sel);
       });
@@ -2084,7 +2143,7 @@ function injectStyles(): void {
     }
     .ov-row:hover .ov-c-act,
     .ov-row.ov-pinned .ov-c-act { opacity: 1 !important; }
-    .ov-pin-btn, .ov-copy-btn, .ov-copy-res-btn {
+    .ov-pin-btn, .ov-copy-btn, .ov-copy-tab-btn {
       all: unset !important;
       cursor: pointer !important;
       font-size: 9px !important;
@@ -2093,7 +2152,7 @@ function injectStyles(): void {
       padding: 1px 4px !important;
       border-radius: 2px !important;
     }
-    .ov-pin-btn:hover, .ov-copy-btn:hover, .ov-copy-res-btn:hover { background: var(--ov-bg-3) !important; color: var(--ov-text) !important; }
+    .ov-pin-btn:hover, .ov-copy-btn:hover, .ov-copy-tab-btn:hover { background: var(--ov-bg-3) !important; color: var(--ov-text) !important; }
     .ov-pin-btn.on { color: var(--ov-m-patch) !important; }
 
     /* ── Detail panel ── */
@@ -2488,7 +2547,7 @@ function injectStyles(): void {
 
     /* Single-endpoint inline badge */
     .ov-fb-single {
-      pointer-events: none !important;
+      pointer-events: auto !important;
       background: #14161a !important;
       border: 1px solid #2a2f37 !important;
       border-radius: 4px !important;
@@ -2555,6 +2614,7 @@ function injectStyles(): void {
       white-space: nowrap !important;
       overflow: hidden !important;
       border-bottom: 1px solid #1e2229 !important;
+      cursor: pointer !important;
     }
     .ov-fb-cluster[data-theme="light"] .ov-fb-row {
       border-bottom-color: #ebe6d8 !important;
