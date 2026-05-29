@@ -7,6 +7,8 @@ type HeaderPair = [string, string];
 type DetailTab = 'response' | 'request' | 'headers' | 'timing' | 'frames';
 type DockState = 'panel' | 'pill' | 'hidden';
 
+// Keep the non-cache fields in sync with PreservedRequest in src/background.ts —
+// every wire field below crosses the messaging boundary for the preserve-log feature.
 interface ApiRequest {
   id: number;
   url: string;
@@ -78,6 +80,13 @@ let filterInput: HTMLInputElement | null = null;
 let caseSensitiveSearch = false;
 let regexSearch = false;
 let dockState: DockState = 'panel';
+const DEFAULT_PANEL_WIDTH = 520;
+const DEFAULT_PANEL_HEIGHT = 640;
+const DEFAULT_PILL_WIDTH = 120;
+type PanelGeom = { left: number; top: number; width: number; height: number };
+type PillGeom = { left: number; top: number };
+let savedPanelGeom: PanelGeom | null = null;
+let savedPillGeom: PillGeom | null = null;
 let showPinTray = false;
 let ghostHeld = false;
 let ghostTimer: number | null = null;
@@ -88,6 +97,109 @@ let valueHighlightIndex = 0;
 let valueHighlightKey = '';
 let bulkHighlightEls: HTMLElement[] = [];
 let bulkHighlightRowId = -1;
+
+// ── Preserve log (per-tab, survives in-tab navigations) ──────────────────────
+
+const PRESERVE_DEBOUNCE_MS = 250;
+const dirtyPreserveIds = new Set<number>();
+// Buffered WS message deltas waiting to be flushed. Sent as a separate payload
+// so chatty connections don't force a full request re-serialize per message.
+const pendingWsMessages = new Map<number, WsMessage[]>();
+let preserveTimer: number | null = null;
+let nextPreservedLocalId = -1;
+
+function schedulePreserveFlush(): void {
+  if (preserveTimer !== null) return;
+  preserveTimer = window.setTimeout(flushPreserve, PRESERVE_DEBOUNCE_MS);
+}
+
+function markPreserveDirty(id: number): void {
+  dirtyPreserveIds.add(id);
+  schedulePreserveFlush();
+}
+
+function markWsMessagePending(wsId: number, m: WsMessage): void {
+  let pending = pendingWsMessages.get(wsId);
+  if (!pending) { pending = []; pendingWsMessages.set(wsId, pending); }
+  pending.push(m);
+  schedulePreserveFlush();
+}
+
+function flushPreserve(): void {
+  preserveTimer = null;
+  if (!dirtyPreserveIds.size && !pendingWsMessages.size) return;
+
+  const reqs: ApiRequest[] = [];
+  for (const id of dirtyPreserveIds) {
+    const r = requests.get(id);
+    if (r) reqs.push(r);
+  }
+  dirtyPreserveIds.clear();
+
+  // A full record already includes its messages array, so any WS deltas for
+  // that same id are redundant — drop them to avoid double-appending in the SW.
+  const sentFullIds = new Set(reqs.map(r => r.id));
+  const wsDeltas: Record<string, WsMessage[]> = {};
+  for (const [id, msgs] of pendingWsMessages) {
+    if (sentFullIds.has(id)) continue;
+    wsDeltas[String(id)] = msgs;
+  }
+  pendingWsMessages.clear();
+
+  if (!reqs.length && !Object.keys(wsDeltas).length) return;
+
+  try {
+    chrome.runtime.sendMessage(
+      { action: 'ov-preserve', reqs, wsDeltas },
+      // Read lastError to silence the "Unchecked runtime.lastError" warning when
+      // the SW is briefly unavailable (cold start, eviction, or unload race).
+      () => void chrome.runtime.lastError,
+    );
+  } catch {
+    // chrome.runtime.sendMessage throws when the extension context has been
+    // invalidated (extension reloaded/uninstalled). Nothing to recover; the
+    // content script will be torn down imminently.
+  }
+}
+
+function clearPreserved(): void {
+  dirtyPreserveIds.clear();
+  pendingWsMessages.clear();
+  if (preserveTimer !== null) { clearTimeout(preserveTimer); preserveTimer = null; }
+  try {
+    chrome.runtime.sendMessage(
+      { action: 'ov-clear-preserved' },
+      () => void chrome.runtime.lastError,
+    );
+  } catch { /* see flushPreserve */ }
+}
+
+function hydrateFromPreserved(onDone: () => void): void {
+  try {
+    chrome.runtime.sendMessage({ action: 'ov-get-preserved' }, (resp: { ok?: boolean; reqs?: ApiRequest[] } | undefined) => {
+      void chrome.runtime.lastError;
+      const list = resp?.reqs;
+      if (Array.isArray(list) && list.length) {
+        // Sort by capture time so the restored slice keeps chronological order
+        // regardless of the SW's storage-roundtrip ordering.
+        list.sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
+        // Remap to negative local IDs so they never collide with the per-page
+        // injected counter (which restarts at 1 after navigation).
+        for (const r of list) {
+          const localId = nextPreservedLocalId--;
+          const copy: ApiRequest = { ...r, id: localId };
+          refreshSearchCache(copy, copy as OverlayMessage);
+          if (pinnedKeys.has(pinKey(copy))) pinnedIds.add(localId);
+          requests.set(localId, copy);
+        }
+        trimRequests();
+      }
+      onDone();
+    });
+  } catch {
+    onDone();
+  }
+}
 
 // ── Render scheduling ─────────────────────────────────────────────────────────
 
@@ -155,7 +267,11 @@ window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
     if (conn) {
       if (!conn.messages) conn.messages = [];
       if (msg.dir && msg.body != null && msg.ts != null) {
-        conn.messages.push({ dir: msg.dir, body: msg.body, ts: msg.ts });
+        const wsmsg: WsMessage = { dir: msg.dir, body: msg.body, ts: msg.ts };
+        conn.messages.push(wsmsg);
+        // Send as a delta so the SW appends instead of re-serializing the
+        // entire (growing) messages array on every chatty-WS tick.
+        markWsMessagePending(conn.id, wsmsg);
       }
       if (conn.messages.length > WS_TRIM_TRIGGER) {
         conn.messages.splice(0, conn.messages.length - MAX_WS_MESSAGES_PER_CONN);
@@ -174,6 +290,10 @@ window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
     // sync pin by key
     const key = pinKey(existing);
     if (pinnedKeys.has(key)) pinnedIds.add(existing.id);
+    // Updates to existing rows are preserved even while paused — pause only
+    // gates *new* entries (the `return` below). Keep this in sync if you ever
+    // refactor the pause semantics.
+    markPreserveDirty(existing.id);
   } else {
     if (paused) return;
     const fresh = { ...msg } as ApiRequest;
@@ -182,6 +302,7 @@ window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
     // restore pin state from persisted keys
     if (pinnedKeys.has(pinKey(fresh))) pinnedIds.add(fresh.id);
     trimRequests();
+    markPreserveDirty(fresh.id);
   }
 
   scheduleRenderUnlessPaused();
@@ -227,6 +348,7 @@ chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, 
       clearAllBadges();
       clearValueHighlights();
       clearBulkHighlights();
+      clearPreserved();
       renderList();
       sendResponse({ ok: true });
       break;
@@ -1283,13 +1405,39 @@ function setDockState(next: DockState): void {
   const panel = $('ov-panel');
   const pill = $('ov-pill');
   if (next === 'panel') {
+    // Carry the pill's current position over to the panel so it expands in place.
+    const pillRect = pill?.getBoundingClientRect();
     $('ov-pill')?.remove();
-    if (!panel) buildPanel();
-    else panel.style.setProperty('display', 'flex', 'important');
+    if (!panelVisible) {
+      panelVisible = true;
+      chrome.storage.local.set({ ovVisible: true });
+    }
+    if (pillRect) {
+      // Panel may be display:none here, so getBoundingClientRect can return 0×0.
+      // Fall through to defaults rather than persisting a zero-size geometry.
+      const measured = panel?.getBoundingClientRect();
+      const w = savedPanelGeom?.width ?? (measured && measured.width > 0 ? measured.width : DEFAULT_PANEL_WIDTH);
+      const h = savedPanelGeom?.height ?? (measured && measured.height > 0 ? measured.height : DEFAULT_PANEL_HEIGHT);
+      savedPanelGeom = { left: pillRect.left, top: pillRect.top, width: w, height: h };
+      chrome.storage.local.set({ ovPanelGeom: savedPanelGeom });
+    }
+    if (!panel) {
+      buildPanel();
+    } else {
+      applySavedGeometry(panel);
+      panel.style.setProperty('display', 'flex', 'important');
+      renderList();
+    }
   } else if (next === 'pill') {
-    if (panel) panel.style.setProperty('display', 'none', 'important');
+    // Carry the panel's current position over to the pill so it collapses in place.
+    if (panel) {
+      const r = panel.getBoundingClientRect();
+      savedPillGeom = { left: r.left, top: r.top };
+      chrome.storage.local.set({ ovPillGeom: savedPillGeom });
+      panel.style.setProperty('display', 'none', 'important');
+    }
     if (!pill) buildPill();
-    else refreshPill();
+    else { applySavedGeometry(pill); refreshPill(); }
   } else {
     if (panel) panel.style.setProperty('display', 'none', 'important');
     $('ov-pill')?.remove();
@@ -1326,6 +1474,7 @@ function buildPill(): void {
   pill.dataset.theme = currentTheme;
   pill.innerHTML = pillInnerHtml();
   document.documentElement.appendChild(pill);
+  applySavedGeometry(pill);
   makeDraggable(pill, pill);
   pill.addEventListener('click', (e) => {
     if ((e.target as HTMLElement).closest('.ov-pill-expand')) {
@@ -1408,6 +1557,7 @@ function buildPanel(): void {
 
   if (!panelVisible) panel.style.setProperty('display', 'none', 'important');
   document.documentElement.appendChild(panel);
+  applySavedGeometry(panel);
 
   filterInput = $('ov-filter') as HTMLInputElement;
 
@@ -1422,7 +1572,9 @@ function buildPanel(): void {
   if (ovCollapse) ovCollapse.onclick = () => setDockState('pill');
   if (ovClear) ovClear.onclick = () => {
     requests.clear(); expandedIds.clear(); detailTabs.clear(); pinnedIds.clear();
-    clearAllBadges(); clearValueHighlights(); clearBulkHighlights(); renderList();
+    clearAllBadges(); clearValueHighlights(); clearBulkHighlights();
+    clearPreserved();
+    renderList();
   };
   if (ovPause) ovPause.onclick = () => setPaused(!paused);
   if (ovTheme) ovTheme.onclick = () => {
@@ -1709,6 +1861,61 @@ function signalInjected(action: 'pause' | 'resume' | 'stop' | 'start'): void {
   window.postMessage({ __apiOverlayControl: true, action }, '*');
 }
 
+function isValidPanelGeom(v: unknown): v is PanelGeom {
+  if (!v || typeof v !== 'object') return false;
+  const g = v as Record<string, unknown>;
+  return Number.isFinite(g.left) && Number.isFinite(g.top)
+    && Number.isFinite(g.width) && (g.width as number) > 0
+    && Number.isFinite(g.height) && (g.height as number) > 0;
+}
+
+function isValidPillGeom(v: unknown): v is PillGeom {
+  if (!v || typeof v !== 'object') return false;
+  const g = v as Record<string, unknown>;
+  return Number.isFinite(g.left) && Number.isFinite(g.top);
+}
+
+function clampToViewport(left: number, top: number, w: number): { left: number; top: number } {
+  const KEEP_VISIBLE = 60;
+  const minLeft = KEEP_VISIBLE - w;
+  const maxLeft = window.innerWidth - KEEP_VISIBLE;
+  const maxTop = Math.max(0, window.innerHeight - KEEP_VISIBLE);
+  return {
+    left: Math.min(maxLeft, Math.max(minLeft, left)),
+    top: Math.min(maxTop, Math.max(0, top)),
+  };
+}
+
+function applySavedGeometry(el: HTMLElement): void {
+  if (el.id === 'ov-panel' && savedPanelGeom) {
+    const { left, top } = clampToViewport(savedPanelGeom.left, savedPanelGeom.top, savedPanelGeom.width);
+    el.style.setProperty('left', `${left}px`, 'important');
+    el.style.setProperty('top', `${top}px`, 'important');
+    el.style.setProperty('right', 'auto', 'important');
+    el.style.setProperty('bottom', 'auto', 'important');
+    el.style.setProperty('width', `${savedPanelGeom.width}px`, 'important');
+    el.style.setProperty('height', `${savedPanelGeom.height}px`, 'important');
+  } else if (el.id === 'ov-pill' && savedPillGeom) {
+    const r = el.getBoundingClientRect();
+    const { left, top } = clampToViewport(savedPillGeom.left, savedPillGeom.top, r.width || DEFAULT_PILL_WIDTH);
+    el.style.setProperty('left', `${left}px`, 'important');
+    el.style.setProperty('top', `${top}px`, 'important');
+    el.style.setProperty('right', 'auto', 'important');
+    el.style.setProperty('bottom', 'auto', 'important');
+  }
+}
+
+function persistGeometry(el: HTMLElement): void {
+  const rect = el.getBoundingClientRect();
+  if (el.id === 'ov-panel') {
+    savedPanelGeom = { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+    chrome.storage.local.set({ ovPanelGeom: savedPanelGeom });
+  } else if (el.id === 'ov-pill') {
+    savedPillGeom = { left: rect.left, top: rect.top };
+    chrome.storage.local.set({ ovPillGeom: savedPillGeom });
+  }
+}
+
 function makeDraggable(panel: HTMLElement, handle: HTMLElement): void {
   let ox = 0, oy = 0;
   handle.addEventListener('mousedown', (e: MouseEvent) => {
@@ -1735,6 +1942,7 @@ function makeDraggable(panel: HTMLElement, handle: HTMLElement): void {
     const up = () => {
       document.removeEventListener('mousemove', move);
       document.removeEventListener('mouseup', up);
+      persistGeometry(panel);
     };
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup', up);
@@ -1772,6 +1980,7 @@ function makeResizable(panel: HTMLElement): void {
     const up = () => {
       document.removeEventListener('mousemove', move);
       document.removeEventListener('mouseup', up);
+      persistGeometry(panel);
     };
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup', up);
@@ -2727,7 +2936,7 @@ function activateOverlay(): void {
   const init = () => {
     loadTheme().then(theme => {
       currentTheme = theme;
-      chrome.storage.local.get(['ovDockState', 'ovPinnedKeys', 'ovFilters'], result => {
+      chrome.storage.local.get(['ovDockState', 'ovPinnedKeys', 'ovFilters', 'ovPanelGeom', 'ovPillGeom'], result => {
         dockState = (result.ovDockState as DockState) || 'panel';
         if (Array.isArray(result.ovPinnedKeys)) {
           for (const k of result.ovPinnedKeys) pinnedKeys.add(k);
@@ -2738,8 +2947,12 @@ function activateOverlay(): void {
           if (f.methods) for (const m of f.methods) activeMethods.add(m);
           if (f.initiators) for (const i of f.initiators) activeInitiators.add(i);
         }
-if (dockState === 'pill') buildPill();
-        else buildPanel();
+        savedPanelGeom = isValidPanelGeom(result.ovPanelGeom) ? result.ovPanelGeom : null;
+        savedPillGeom = isValidPillGeom(result.ovPillGeom) ? result.ovPillGeom : null;
+        hydrateFromPreserved(() => {
+          if (dockState === 'pill') buildPill();
+          else buildPanel();
+        });
       });
     });
   };
@@ -2770,6 +2983,15 @@ function deactivateOverlay(): void {
   }
   signalInjected('stop');
   cancelScheduledRender();
+  // NOTE: do NOT clearPreserved() here — deactivation can fire from a transient
+  // allowlist toggle (or extension reload), and dropping the user's captured
+  // log on that path would be surprising. Preserved data is only cleared on
+  // explicit user "Clear" or when the tab closes (handled by the SW).
+  // Flush any pending writes so they reach the SW before this script dies.
+  flushPreserve();
+  dirtyPreserveIds.clear();
+  pendingWsMessages.clear();
+  if (preserveTimer !== null) { clearTimeout(preserveTimer); preserveTimer = null; }
   document.getElementById('ov-panel')?.remove();
   document.getElementById('ov-pill')?.remove();
   document.getElementById('ov-styles')?.remove();
