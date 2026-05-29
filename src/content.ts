@@ -80,6 +80,13 @@ let filterInput: HTMLInputElement | null = null;
 let caseSensitiveSearch = false;
 let regexSearch = false;
 let dockState: DockState = 'panel';
+const DEFAULT_PANEL_WIDTH = 520;
+const DEFAULT_PANEL_HEIGHT = 640;
+const DEFAULT_PILL_WIDTH = 120;
+type PanelGeom = { left: number; top: number; width: number; height: number };
+type PillGeom = { left: number; top: number };
+let savedPanelGeom: PanelGeom | null = null;
+let savedPillGeom: PillGeom | null = null;
 let showPinTray = false;
 let ghostHeld = false;
 let ghostTimer: number | null = null;
@@ -1398,21 +1405,39 @@ function setDockState(next: DockState): void {
   const panel = $('ov-panel');
   const pill = $('ov-pill');
   if (next === 'panel') {
+    // Carry the pill's current position over to the panel so it expands in place.
+    const pillRect = pill?.getBoundingClientRect();
     $('ov-pill')?.remove();
     if (!panelVisible) {
       panelVisible = true;
       chrome.storage.local.set({ ovVisible: true });
     }
+    if (pillRect) {
+      // Panel may be display:none here, so getBoundingClientRect can return 0×0.
+      // Fall through to defaults rather than persisting a zero-size geometry.
+      const measured = panel?.getBoundingClientRect();
+      const w = savedPanelGeom?.width ?? (measured && measured.width > 0 ? measured.width : DEFAULT_PANEL_WIDTH);
+      const h = savedPanelGeom?.height ?? (measured && measured.height > 0 ? measured.height : DEFAULT_PANEL_HEIGHT);
+      savedPanelGeom = { left: pillRect.left, top: pillRect.top, width: w, height: h };
+      chrome.storage.local.set({ ovPanelGeom: savedPanelGeom });
+    }
     if (!panel) {
       buildPanel();
     } else {
+      applySavedGeometry(panel);
       panel.style.setProperty('display', 'flex', 'important');
       renderList();
     }
   } else if (next === 'pill') {
-    if (panel) panel.style.setProperty('display', 'none', 'important');
+    // Carry the panel's current position over to the pill so it collapses in place.
+    if (panel) {
+      const r = panel.getBoundingClientRect();
+      savedPillGeom = { left: r.left, top: r.top };
+      chrome.storage.local.set({ ovPillGeom: savedPillGeom });
+      panel.style.setProperty('display', 'none', 'important');
+    }
     if (!pill) buildPill();
-    else refreshPill();
+    else { applySavedGeometry(pill); refreshPill(); }
   } else {
     if (panel) panel.style.setProperty('display', 'none', 'important');
     $('ov-pill')?.remove();
@@ -1449,6 +1474,7 @@ function buildPill(): void {
   pill.dataset.theme = currentTheme;
   pill.innerHTML = pillInnerHtml();
   document.documentElement.appendChild(pill);
+  applySavedGeometry(pill);
   makeDraggable(pill, pill);
   pill.addEventListener('click', (e) => {
     if ((e.target as HTMLElement).closest('.ov-pill-expand')) {
@@ -1531,6 +1557,7 @@ function buildPanel(): void {
 
   if (!panelVisible) panel.style.setProperty('display', 'none', 'important');
   document.documentElement.appendChild(panel);
+  applySavedGeometry(panel);
 
   filterInput = $('ov-filter') as HTMLInputElement;
 
@@ -1834,6 +1861,61 @@ function signalInjected(action: 'pause' | 'resume' | 'stop' | 'start'): void {
   window.postMessage({ __apiOverlayControl: true, action }, '*');
 }
 
+function isValidPanelGeom(v: unknown): v is PanelGeom {
+  if (!v || typeof v !== 'object') return false;
+  const g = v as Record<string, unknown>;
+  return Number.isFinite(g.left) && Number.isFinite(g.top)
+    && Number.isFinite(g.width) && (g.width as number) > 0
+    && Number.isFinite(g.height) && (g.height as number) > 0;
+}
+
+function isValidPillGeom(v: unknown): v is PillGeom {
+  if (!v || typeof v !== 'object') return false;
+  const g = v as Record<string, unknown>;
+  return Number.isFinite(g.left) && Number.isFinite(g.top);
+}
+
+function clampToViewport(left: number, top: number, w: number): { left: number; top: number } {
+  const KEEP_VISIBLE = 60;
+  const minLeft = KEEP_VISIBLE - w;
+  const maxLeft = window.innerWidth - KEEP_VISIBLE;
+  const maxTop = Math.max(0, window.innerHeight - KEEP_VISIBLE);
+  return {
+    left: Math.min(maxLeft, Math.max(minLeft, left)),
+    top: Math.min(maxTop, Math.max(0, top)),
+  };
+}
+
+function applySavedGeometry(el: HTMLElement): void {
+  if (el.id === 'ov-panel' && savedPanelGeom) {
+    const { left, top } = clampToViewport(savedPanelGeom.left, savedPanelGeom.top, savedPanelGeom.width);
+    el.style.setProperty('left', `${left}px`, 'important');
+    el.style.setProperty('top', `${top}px`, 'important');
+    el.style.setProperty('right', 'auto', 'important');
+    el.style.setProperty('bottom', 'auto', 'important');
+    el.style.setProperty('width', `${savedPanelGeom.width}px`, 'important');
+    el.style.setProperty('height', `${savedPanelGeom.height}px`, 'important');
+  } else if (el.id === 'ov-pill' && savedPillGeom) {
+    const r = el.getBoundingClientRect();
+    const { left, top } = clampToViewport(savedPillGeom.left, savedPillGeom.top, r.width || DEFAULT_PILL_WIDTH);
+    el.style.setProperty('left', `${left}px`, 'important');
+    el.style.setProperty('top', `${top}px`, 'important');
+    el.style.setProperty('right', 'auto', 'important');
+    el.style.setProperty('bottom', 'auto', 'important');
+  }
+}
+
+function persistGeometry(el: HTMLElement): void {
+  const rect = el.getBoundingClientRect();
+  if (el.id === 'ov-panel') {
+    savedPanelGeom = { left: rect.left, top: rect.top, width: rect.width, height: rect.height };
+    chrome.storage.local.set({ ovPanelGeom: savedPanelGeom });
+  } else if (el.id === 'ov-pill') {
+    savedPillGeom = { left: rect.left, top: rect.top };
+    chrome.storage.local.set({ ovPillGeom: savedPillGeom });
+  }
+}
+
 function makeDraggable(panel: HTMLElement, handle: HTMLElement): void {
   let ox = 0, oy = 0;
   handle.addEventListener('mousedown', (e: MouseEvent) => {
@@ -1860,6 +1942,7 @@ function makeDraggable(panel: HTMLElement, handle: HTMLElement): void {
     const up = () => {
       document.removeEventListener('mousemove', move);
       document.removeEventListener('mouseup', up);
+      persistGeometry(panel);
     };
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup', up);
@@ -1897,6 +1980,7 @@ function makeResizable(panel: HTMLElement): void {
     const up = () => {
       document.removeEventListener('mousemove', move);
       document.removeEventListener('mouseup', up);
+      persistGeometry(panel);
     };
     document.addEventListener('mousemove', move);
     document.addEventListener('mouseup', up);
@@ -2852,7 +2936,7 @@ function activateOverlay(): void {
   const init = () => {
     loadTheme().then(theme => {
       currentTheme = theme;
-      chrome.storage.local.get(['ovDockState', 'ovPinnedKeys', 'ovFilters'], result => {
+      chrome.storage.local.get(['ovDockState', 'ovPinnedKeys', 'ovFilters', 'ovPanelGeom', 'ovPillGeom'], result => {
         dockState = (result.ovDockState as DockState) || 'panel';
         if (Array.isArray(result.ovPinnedKeys)) {
           for (const k of result.ovPinnedKeys) pinnedKeys.add(k);
@@ -2863,6 +2947,8 @@ function activateOverlay(): void {
           if (f.methods) for (const m of f.methods) activeMethods.add(m);
           if (f.initiators) for (const i of f.initiators) activeInitiators.add(i);
         }
+        savedPanelGeom = isValidPanelGeom(result.ovPanelGeom) ? result.ovPanelGeom : null;
+        savedPillGeom = isValidPillGeom(result.ovPillGeom) ? result.ovPillGeom : null;
         hydrateFromPreserved(() => {
           if (dockState === 'pill') buildPill();
           else buildPanel();
