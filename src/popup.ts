@@ -1,5 +1,8 @@
 /// <reference types="chrome" />
 
+type PopupFontFamilyKey = 'mono' | 'sans' | 'serif';
+type PopupFontSizeKey = 's' | 'm' | 'l' | 'xl';
+
 let visible = true;
 let capturePaused = false;
 let siteEnabled = false;
@@ -62,6 +65,17 @@ const btnExport     = document.getElementById('btn-export') as HTMLButtonElement
 const btnClear      = document.getElementById('btn-clear') as HTMLButtonElement;
 const btnDark       = document.getElementById('btn-dark') as HTMLButtonElement;
 const btnLight      = document.getElementById('btn-light') as HTMLButtonElement;
+const fontBtns: Record<PopupFontFamilyKey, HTMLButtonElement> = {
+  mono:  document.getElementById('btn-font-mono')  as HTMLButtonElement,
+  sans:  document.getElementById('btn-font-sans')  as HTMLButtonElement,
+  serif: document.getElementById('btn-font-serif') as HTMLButtonElement,
+};
+const sizeBtns: Record<PopupFontSizeKey, HTMLButtonElement> = {
+  s:  document.getElementById('btn-size-s')  as HTMLButtonElement,
+  m:  document.getElementById('btn-size-m')  as HTMLButtonElement,
+  l:  document.getElementById('btn-size-l')  as HTMLButtonElement,
+  xl: document.getElementById('btn-size-xl') as HTMLButtonElement,
+};
 const hostInput     = document.getElementById('host-input') as HTMLInputElement;
 const btnAddHost    = document.getElementById('btn-add-host') as HTMLButtonElement;
 const siteCountEl   = document.getElementById('site-count') as HTMLElement;
@@ -74,6 +88,20 @@ function applyPopupTheme(theme: 'dark' | 'light'): void {
   document.body.dataset.theme = theme;
   btnDark.className  = `btn${theme === 'dark'  ? ' primary' : ''}`;
   btnLight.className = `btn${theme === 'light' ? ' primary' : ''}`;
+}
+
+function applyPopupFontFamily(family: PopupFontFamilyKey): void {
+  const valid = family in fontBtns ? family : 'mono';
+  for (const key of Object.keys(fontBtns) as PopupFontFamilyKey[]) {
+    fontBtns[key].className = `btn${key === valid ? ' primary' : ''}`;
+  }
+}
+
+function applyPopupFontSize(size: PopupFontSizeKey): void {
+  const valid = size in sizeBtns ? size : 'm';
+  for (const key of Object.keys(sizeBtns) as PopupFontSizeKey[]) {
+    sizeBtns[key].className = `btn${key === valid ? ' primary' : ''}`;
+  }
 }
 
 function applyVisibleState(v: boolean): void {
@@ -178,9 +206,12 @@ async function init(): Promise<void> {
   let synced = false;
   if (currentTabId != null) {
     const resp = await sendMessageSafe(currentTabId, { action: 'get-state' }) as
-      { visible?: boolean; paused?: boolean; theme?: 'dark' | 'light'; count?: number } | null;
+      { visible?: boolean; paused?: boolean; theme?: 'dark' | 'light';
+        fontFamily?: PopupFontFamilyKey; fontSize?: PopupFontSizeKey; count?: number } | null;
     if (resp) {
       applyPopupTheme(resp.theme || 'dark');
+      applyPopupFontFamily(resp.fontFamily || 'mono');
+      applyPopupFontSize(resp.fontSize || 'm');
       applyVisibleState(resp.visible !== false);
       applyPausedState(resp.paused === true);
       if (typeof resp.count === 'number') requestCount = resp.count;
@@ -190,12 +221,16 @@ async function init(): Promise<void> {
 
   if (!synced) {
     await new Promise<void>(resolve => {
-      chrome.storage.local.get(['ovTheme', 'ovVisible', 'ovPaused'], ({ ovTheme, ovVisible, ovPaused }) => {
-        applyPopupTheme((ovTheme as 'dark' | 'light') || 'dark');
-        applyVisibleState(ovVisible !== false);
-        applyPausedState(ovPaused === true);
-        resolve();
-      });
+      chrome.storage.local.get(
+        ['ovTheme', 'ovVisible', 'ovPaused', 'ovFontFamily', 'ovFontSize'],
+        ({ ovTheme, ovVisible, ovPaused, ovFontFamily, ovFontSize }) => {
+          applyPopupTheme((ovTheme as 'dark' | 'light') || 'dark');
+          applyPopupFontFamily((ovFontFamily as PopupFontFamilyKey) || 'mono');
+          applyPopupFontSize((ovFontSize as PopupFontSizeKey) || 'm');
+          applyVisibleState(ovVisible !== false);
+          applyPausedState(ovPaused === true);
+          resolve();
+        });
     });
   }
 
@@ -215,6 +250,22 @@ btnLight.addEventListener('click', async () => {
   applyPopupTheme('light');
   await send('theme', { value: 'light' });
 });
+
+for (const key of Object.keys(fontBtns) as PopupFontFamilyKey[]) {
+  fontBtns[key].addEventListener('click', async () => {
+    applyPopupFontFamily(key);
+    // The content script always listens (even when the panel isn't built), so it
+    // persists the preference to storage and applies it live where active.
+    await send('font-family', { value: key });
+  });
+}
+
+for (const key of Object.keys(sizeBtns) as PopupFontSizeKey[]) {
+  sizeBtns[key].addEventListener('click', async () => {
+    applyPopupFontSize(key);
+    await send('font-size', { value: key });
+  });
+}
 
 btnToggle.addEventListener('click', async () => {
   const prev = visible;

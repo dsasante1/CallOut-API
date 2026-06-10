@@ -71,6 +71,24 @@ let panelVisible = true;
 let activeHighlight: HTMLElement | null = null;
 let paused = false;
 let currentTheme: 'dark' | 'light' = 'dark';
+
+// ── Font preferences ──
+// Family/size are exposed in the popup as named keys; these maps resolve them to
+// the actual CSS values applied via the --ov-font-* custom properties. Defaults
+// preserve the original look (mono stack at scale 1).
+type FontFamilyKey = 'mono' | 'sans' | 'serif';
+type FontSizeKey = 's' | 'm' | 'l' | 'xl';
+
+const FONT_FAMILIES: Record<FontFamilyKey, string> = {
+  mono:  "'JetBrains Mono','IBM Plex Mono',ui-monospace,monospace",
+  sans:  "system-ui,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif",
+  serif: "Georgia,Cambria,'Times New Roman',Times,serif",
+};
+const FONT_SCALES: Record<FontSizeKey, number> = { s: 0.85, m: 1, l: 1.2, xl: 1.4 };
+
+let currentFontFamily: FontFamilyKey = 'mono';
+let currentFontSize: FontSizeKey = 'm';
+
 let activated = false;
 let cspBlocked = false;
 let renderScheduled = false;
@@ -316,7 +334,7 @@ window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
 chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, _sender, sendResponse) => {
   switch (msg.action) {
     case 'get-state':
-      sendResponse({ visible: panelVisible, paused, theme: currentTheme, activated, count: requests.size });
+      sendResponse({ visible: panelVisible, paused, theme: currentTheme, fontFamily: currentFontFamily, fontSize: currentFontSize, activated, count: requests.size });
       break;
     case 'activate':
       activateOverlay();
@@ -365,6 +383,24 @@ chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, 
       sendResponse({ theme: currentTheme });
       break;
     }
+    case 'font-family': {
+      const family = msg.value as FontFamilyKey;
+      if (family in FONT_FAMILIES) {
+        chrome.storage.local.set({ ovFontFamily: family });
+        applyFont(family, currentFontSize);
+      }
+      sendResponse({ fontFamily: currentFontFamily });
+      break;
+    }
+    case 'font-size': {
+      const size = msg.value as FontSizeKey;
+      if (size in FONT_SCALES) {
+        chrome.storage.local.set({ ovFontSize: size });
+        applyFont(currentFontFamily, size);
+      }
+      sendResponse({ fontSize: currentFontSize });
+      break;
+    }
     default:
       sendResponse({ ok: false });
   }
@@ -402,6 +438,29 @@ function loadTheme(): Promise<'dark' | 'light'> {
   return new Promise(resolve => {
     chrome.storage.local.get('ovTheme', result => {
       resolve((result.ovTheme as 'dark' | 'light') || 'dark');
+    });
+  });
+}
+
+// Font preferences are applied as custom properties on the document root. The
+// `all: initial` reset on #ov-panel does NOT reset custom properties, so these
+// inherit into the panel, pill, and dynamically-created badges alike.
+function applyFont(family: FontFamilyKey, size: FontSizeKey): void {
+  currentFontFamily = FONT_FAMILIES[family] ? family : 'mono';
+  currentFontSize = FONT_SCALES[size] ? size : 'm';
+  const root = document.documentElement;
+  root.style.setProperty('--ov-font-family', FONT_FAMILIES[currentFontFamily]);
+  root.style.setProperty('--ov-font-scale', String(FONT_SCALES[currentFontSize]));
+}
+
+function loadFont(): Promise<{ family: FontFamilyKey; size: FontSizeKey }> {
+  return new Promise(resolve => {
+    chrome.storage.local.get(['ovFontFamily', 'ovFontSize'], result => {
+      const family = (result.ovFontFamily as FontFamilyKey) in FONT_FAMILIES
+        ? (result.ovFontFamily as FontFamilyKey) : 'mono';
+      const size = (result.ovFontSize as FontSizeKey) in FONT_SCALES
+        ? (result.ovFontSize as FontSizeKey) : 'm';
+      resolve({ family, size });
     });
   });
 }
@@ -2038,8 +2097,8 @@ function injectStyles(): void {
       border-radius: 2px !important;
       box-shadow: 0 12px 40px var(--ov-shadow) !important;
       z-index: 2147483647 !important;
-      font-family: 'JetBrains Mono','IBM Plex Mono',ui-monospace,monospace !important;
-      font-size: 12px !important;
+      font-family: var(--ov-font-family,'JetBrains Mono','IBM Plex Mono',ui-monospace,monospace) !important;
+      font-size: calc(12px * var(--ov-font-scale,1)) !important;
       display: flex !important;
       flex-direction: column !important;
       overflow: hidden !important;
@@ -2110,14 +2169,14 @@ function injectStyles(): void {
     }
     .ov-hdr-title {
       font-weight: 700 !important;
-      font-size: 10px !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
       color: var(--ov-title) !important;
       letter-spacing: .1em !important;
       text-transform: uppercase !important;
       flex-shrink: 0 !important;
     }
     .ov-count-badge {
-      font-size: 9px !important;
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
       color: var(--ov-text-faint) !important;
       background: var(--ov-bg-3) !important;
       border: 1px solid var(--ov-border) !important;
@@ -2141,7 +2200,7 @@ function injectStyles(): void {
       padding: 3px 7px !important;
       border-radius: 2px !important;
       cursor: pointer !important;
-      font-size: 10px !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
       font-family: inherit !important;
       white-space: nowrap !important;
       border: 1px solid transparent !important;
@@ -2167,7 +2226,7 @@ function injectStyles(): void {
     }
     .ov-prompt {
       color: var(--ov-text-muted) !important;
-      font-size: 13px !important;
+      font-size: calc(13px * var(--ov-font-scale,1)) !important;
       padding: 0 4px !important;
       flex-shrink: 0 !important;
     }
@@ -2175,7 +2234,7 @@ function injectStyles(): void {
       all: unset !important;
       flex: 1 !important;
       color: var(--ov-text) !important;
-      font-size: 11px !important;
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
       font-family: inherit !important;
       padding: 5px 4px !important;
     }
@@ -2186,7 +2245,7 @@ function injectStyles(): void {
       all: unset !important;
       cursor: pointer !important;
       padding: 2px 5px !important;
-      font-size: 10px !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
       font-weight: 700 !important;
       font-family: inherit !important;
       color: var(--ov-text-faint) !important;
@@ -2208,7 +2267,7 @@ function injectStyles(): void {
       flex-wrap: wrap !important;
     }
     .ov-chip-label {
-      font-size: 9px !important;
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
       letter-spacing: .06em !important;
       text-transform: uppercase !important;
       color: var(--ov-text-faint) !important;
@@ -2218,7 +2277,7 @@ function injectStyles(): void {
     .ov-chip {
       all: unset !important;
       cursor: pointer !important;
-      font-size: 9px !important;
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
       font-weight: 700 !important;
       font-family: inherit !important;
       letter-spacing: .04em !important;
@@ -2242,7 +2301,7 @@ function injectStyles(): void {
     .ov-chip[data-m="DELETE"].on { color: var(--ov-m-delete) !important; border-color: var(--ov-m-delete) !important; }
     .ov-chip[data-m="WS"].on     { color: var(--ov-m-ws) !important;     border-color: var(--ov-m-ws) !important; }
     .ov-chip-count {
-      font-size: 8px !important;
+      font-size: calc(8px * var(--ov-font-scale,1)) !important;
       margin-left: 3px !important;
       color: var(--ov-text-faint) !important;
     }
@@ -2296,12 +2355,12 @@ function injectStyles(): void {
       white-space: nowrap !important;
       overflow: hidden !important;
       text-overflow: ellipsis !important;
-      font-size: 11px !important;
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
       line-height: 26px !important;
     }
     .ov-c-method {
       font-weight: 700 !important;
-      font-size: 9px !important;
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
       letter-spacing: .04em !important;
       text-align: right !important;
       padding-right: 6px !important;
@@ -2314,7 +2373,7 @@ function injectStyles(): void {
     .ov-c-method.m-ws     { color: var(--ov-m-ws)     !important; }
     .ov-c-status {
       font-weight: 700 !important;
-      font-size: 10px !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
     }
     .ov-c-status.s-2xx     { color: var(--ov-s-2xx) !important; }
     .ov-c-status.s-3xx     { color: var(--ov-s-3xx) !important; }
@@ -2324,14 +2383,14 @@ function injectStyles(): void {
     .ov-c-status.s-pending { color: var(--ov-s-pending) !important; }
     .ov-c-dur {
       color: var(--ov-text-muted) !important;
-      font-size: 10px !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
       font-variant-numeric: tabular-nums !important;
     }
     .ov-c-url { flex: 1 !important; display: flex !important; align-items: center !important; gap: 4px !important; }
     .ov-url-path { color: var(--ov-text-dim) !important; overflow: hidden !important; text-overflow: ellipsis !important; }
-    .ov-fr { font-size: 9px !important; color: var(--ov-m-ws) !important; flex-shrink: 0 !important; }
+    .ov-fr { font-size: calc(9px * var(--ov-font-scale,1)) !important; color: var(--ov-m-ws) !important; flex-shrink: 0 !important; }
     .ov-init {
-      font-size: 8px !important;
+      font-size: calc(8px * var(--ov-font-scale,1)) !important;
       color: var(--ov-text-muted) !important;
       border: 1px solid var(--ov-border) !important;
       padding: 0 3px !important;
@@ -2355,7 +2414,7 @@ function injectStyles(): void {
     .ov-pin-btn, .ov-copy-btn, .ov-copy-tab-btn {
       all: unset !important;
       cursor: pointer !important;
-      font-size: 9px !important;
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
       font-family: inherit !important;
       color: var(--ov-text-muted) !important;
       padding: 1px 4px !important;
@@ -2384,7 +2443,7 @@ function injectStyles(): void {
       all: unset !important;
       cursor: pointer !important;
       padding: 4px 10px !important;
-      font-size: 10px !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
       font-weight: 700 !important;
       letter-spacing: .04em !important;
       color: var(--ov-text-muted) !important;
@@ -2395,7 +2454,7 @@ function injectStyles(): void {
     .ov-tab:hover { color: var(--ov-text) !important; }
     .ov-tab.ov-tab-active { color: var(--ov-accent) !important; border-bottom-color: var(--ov-accent) !important; }
     .ov-detail-label {
-      font-size: 9px !important;
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
       font-weight: 700 !important;
       color: var(--ov-text-muted) !important;
       letter-spacing: .06em !important;
@@ -2403,7 +2462,7 @@ function injectStyles(): void {
       margin-bottom: 4px !important;
     }
     .ov-trigger-full {
-      font-size: 10px !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
       color: var(--ov-text-dim) !important;
       padding: 3px 0 !important;
     }
@@ -2421,7 +2480,7 @@ function injectStyles(): void {
       display: flex !important;
       gap: 8px !important;
       padding: 2px 8px !important;
-      font-size: 10px !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
       line-height: 1.4 !important;
     }
     .ov-hdr-row:hover { background: var(--ov-bg-2) !important; }
@@ -2441,7 +2500,7 @@ function injectStyles(): void {
       border: 1px solid var(--ov-border) !important;
       border-radius: 2px !important;
       padding: 6px 8px !important;
-      font-size: 10px !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
       font-family: inherit !important;
       color: var(--ov-s-2xx) !important;
       white-space: pre-wrap !important;
@@ -2457,7 +2516,7 @@ function injectStyles(): void {
       border: 1px solid var(--ov-border) !important;
       border-radius: 2px !important;
       padding: 6px 8px !important;
-      font-size: 10px !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
       font-family: inherit !important;
       color: var(--ov-text) !important;
       white-space: pre-wrap !important;
@@ -2501,7 +2560,7 @@ function injectStyles(): void {
     .ov-jv:hover { background: var(--ov-accent-bg) !important; }
     .ov-jv.ov-jv-active { background: rgba(255,90,110,.2) !important; box-shadow: inset 0 0 0 1px var(--ov-s-err) !important; }
     .ov-jv-trunc { color: var(--ov-text-faint) !important; font-style: italic !important; }
-    .ov-body-none { font-size: 10px !important; color: var(--ov-text-faint) !important; font-style: italic !important; }
+    .ov-body-none { font-size: calc(10px * var(--ov-font-scale,1)) !important; color: var(--ov-text-faint) !important; font-style: italic !important; }
     .ov-value-status {
       display: inline-block !important;
       margin-left: 6px !important;
@@ -2509,7 +2568,7 @@ function injectStyles(): void {
       background: var(--ov-s-err) !important;
       color: #fff !important;
       border-radius: 2px !important;
-      font-size: 9px !important;
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
       font-weight: 700 !important;
       vertical-align: middle !important;
     }
@@ -2520,11 +2579,11 @@ function injectStyles(): void {
     .ov-ws-thread::-webkit-scrollbar { width: 8px !important; }
     .ov-ws-thread::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; }
     .ov-ws-msg { display: flex !important; gap: 6px !important; margin: 3px 0 !important; align-items: flex-start !important; }
-    .ov-ws-dir { font-size: 9px !important; font-weight: 700 !important; padding: 1px 4px !important; border-radius: 1px !important; flex-shrink: 0 !important; }
+    .ov-ws-dir { font-size: calc(9px * var(--ov-font-scale,1)) !important; font-weight: 700 !important; padding: 1px 4px !important; border-radius: 1px !important; flex-shrink: 0 !important; }
     .ov-ws-sent .ov-ws-dir { background: rgba(78,201,176,.15) !important; color: var(--ov-m-ws) !important; }
     .ov-ws-recv .ov-ws-dir { background: var(--ov-accent-bg) !important; color: var(--ov-accent) !important; }
-    .ov-ws-body { all: unset !important; display: block !important; font-size: 10px !important; font-family: inherit !important; color: var(--ov-text-dim) !important; white-space: pre-wrap !important; word-break: break-all !important; flex: 1 !important; }
-    .ov-ws-t { font-size: 9px !important; color: var(--ov-text-faint) !important; flex-shrink: 0 !important; margin-top: 1px !important; }
+    .ov-ws-body { all: unset !important; display: block !important; font-size: calc(10px * var(--ov-font-scale,1)) !important; font-family: inherit !important; color: var(--ov-text-dim) !important; white-space: pre-wrap !important; word-break: break-all !important; flex: 1 !important; }
+    .ov-ws-t { font-size: calc(9px * var(--ov-font-scale,1)) !important; color: var(--ov-text-faint) !important; flex-shrink: 0 !important; margin-top: 1px !important; }
 
     /* ── Tab spacer & pane containers ── */
     .ov-tab-spacer { flex: 1 !important; }
@@ -2533,12 +2592,12 @@ function injectStyles(): void {
       display: grid !important;
       grid-template-columns: 80px 1fr !important;
       gap: 2px 8px !important;
-      font-size: 10px !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
       padding: 4px 2px !important;
     }
     .ov-kv-k {
       color: var(--ov-text-muted) !important;
-      font-size: 9px !important;
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
       font-weight: 700 !important;
       letter-spacing: .04em !important;
       text-transform: uppercase !important;
@@ -2556,7 +2615,7 @@ function injectStyles(): void {
       text-align: center !important;
       padding: 30px 10px !important;
       line-height: 1.7 !important;
-      font-size: 11px !important;
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
     }
 
     /* ── Pin tray ── */
@@ -2565,7 +2624,7 @@ function injectStyles(): void {
       background: var(--ov-bg-2) !important;
     }
     .ov-pintray-head {
-      font-size: 9px !important;
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
       font-weight: 700 !important;
       letter-spacing: .06em !important;
       text-transform: uppercase !important;
@@ -2573,7 +2632,7 @@ function injectStyles(): void {
       padding: 4px 8px 2px !important;
     }
     .ov-pintray-empty {
-      font-size: 10px !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
       color: var(--ov-text-faint) !important;
       padding: 4px 8px 6px !important;
       font-style: italic !important;
@@ -2585,7 +2644,7 @@ function injectStyles(): void {
       align-items: center !important;
       gap: 10px !important;
       padding: 4px 10px !important;
-      font-size: 10px !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
       color: var(--ov-text-muted) !important;
       border-top: 1px solid var(--ov-border) !important;
       flex-shrink: 0 !important;
@@ -2599,7 +2658,7 @@ function injectStyles(): void {
     .ov-pin-toggle {
       all: unset !important;
       cursor: pointer !important;
-      font-size: 9px !important;
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
       font-family: inherit !important;
       color: var(--ov-text-muted) !important;
       padding: 1px 5px !important;
@@ -2635,8 +2694,8 @@ function injectStyles(): void {
       background: #14161a !important;
       border: 1px solid #2a2f37 !important;
       border-radius: 16px !important;
-      font-family: 'JetBrains Mono','IBM Plex Mono',ui-monospace,monospace !important;
-      font-size: 11px !important;
+      font-family: var(--ov-font-family,'JetBrains Mono','IBM Plex Mono',ui-monospace,monospace) !important;
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
       color: #d6dae0 !important;
       cursor: move !important;
       box-shadow: 0 4px 20px rgba(0,0,0,.55) !important;
@@ -2654,15 +2713,15 @@ function injectStyles(): void {
       background: #4ec9b0 !important;
       flex-shrink: 0 !important;
     }
-    .ov-pill-count { font-weight: 700 !important; font-size: 12px !important; }
+    .ov-pill-count { font-weight: 700 !important; font-size: calc(12px * var(--ov-font-scale,1)) !important; }
     .ov-pill-label {
       color: #6a7180 !important;
-      font-size: 9px !important;
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
       font-weight: 700 !important;
       letter-spacing: .06em !important;
       text-transform: uppercase !important;
     }
-    .ov-pill-err { color: #ff5a6e !important; font-weight: 700 !important; font-size: 10px !important; }
+    .ov-pill-err { color: #ff5a6e !important; font-weight: 700 !important; font-size: calc(10px * var(--ov-font-scale,1)) !important; }
     .ov-pill-rail { display: flex !important; gap: 2px !important; align-items: center !important; margin: 0 2px !important; }
     .ov-pill-tick {
       width: 3px !important; height: 12px !important;
@@ -2677,7 +2736,7 @@ function injectStyles(): void {
     .ov-pill-expand {
       all: unset !important;
       cursor: pointer !important;
-      font-size: 11px !important;
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
       color: #6a7180 !important;
       padding: 0 3px !important;
       line-height: 1 !important;
@@ -2709,7 +2768,7 @@ function injectStyles(): void {
       position: absolute !important;
       z-index: 2147483645 !important;
       pointer-events: none !important;
-      font-family: 'JetBrains Mono','IBM Plex Mono',ui-monospace,monospace !important;
+      font-family: var(--ov-font-family,'JetBrains Mono','IBM Plex Mono',ui-monospace,monospace) !important;
     }
     .ov-fb-cluster {
       pointer-events: auto !important;
@@ -2781,7 +2840,7 @@ function injectStyles(): void {
       width: 26px !important;
       height: 26px !important;
       border-radius: 50% !important;
-      font-size: 11px !important;
+      font-size: calc(11px * var(--ov-font-scale,1)) !important;
       font-weight: 700 !important;
       cursor: pointer !important;
       box-shadow: 0 2px 8px rgba(0,0,0,.45) !important;
@@ -2831,7 +2890,7 @@ function injectStyles(): void {
     .ov-fb-row:last-child { border-bottom: none !important; }
     .ov-fb-m {
       font-weight: 700 !important;
-      font-size: 9px !important;
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
       letter-spacing: .04em !important;
       padding: 1px 5px !important;
       border-radius: 2px !important;
@@ -2845,7 +2904,7 @@ function injectStyles(): void {
     .ov-fb-m-delete { background: #d23158 !important; }
     .ov-fb-m-ws     { background: #1a8473 !important; }
     .ov-fb-url {
-      font-size: 10px !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
       overflow: hidden !important;
       text-overflow: ellipsis !important;
       flex: 1 1 0 !important;
@@ -2853,7 +2912,7 @@ function injectStyles(): void {
     }
     .ov-fb-s {
       font-weight: 700 !important;
-      font-size: 10px !important;
+      font-size: calc(10px * var(--ov-font-scale,1)) !important;
       flex-shrink: 0 !important;
     }
     .ov-fb-s-2 { color: #4ec9b0 !important; }
@@ -2877,8 +2936,8 @@ function injectStyles(): void {
       border: 1px solid var(--ov-border) !important;
       border-radius: 2px !important;
       padding: 4px 8px !important;
-      font-size: 9px !important;
-      font-family: 'JetBrains Mono','IBM Plex Mono',ui-monospace,monospace !important;
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
+      font-family: var(--ov-font-family,'JetBrains Mono','IBM Plex Mono',ui-monospace,monospace) !important;
       line-height: 1.5 !important;
       white-space: nowrap !important;
       pointer-events: none !important;
@@ -2934,6 +2993,7 @@ function activateOverlay(): void {
   }
 
   const init = () => {
+    loadFont().then(({ family, size }) => applyFont(family, size));
     loadTheme().then(theme => {
       currentTheme = theme;
       chrome.storage.local.get(['ovDockState', 'ovPinnedKeys', 'ovFilters', 'ovPanelGeom', 'ovPillGeom'], result => {
