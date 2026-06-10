@@ -116,6 +116,11 @@ body[data-theme="light"] {
 .status-line.off .state { color: var(--fg-mute); }
 
 /* ── Buttons ── */
+.fld-label {
+  font-size: 9px; color: var(--fg-3);
+  letter-spacing: 0.08em; text-transform: uppercase;
+  margin: 10px 0 6px;
+}
 .row { display: flex; gap: 6px; margin-bottom: 6px; }
 .row:last-child { margin-bottom: 0; }
 .btn {
@@ -334,6 +339,19 @@ body[data-theme="light"] {
   <div class="row">
     <button class="btn primary" id="btn-dark" data-tip="Switch to dark theme">dark</button>
     <button class="btn" id="btn-light" data-tip="Switch to light theme" data-tip-align="right">light</button>
+  </div>
+  <div class="fld-label">Font</div>
+  <div class="row">
+    <button class="btn" id="btn-font-mono" data-tip="Monospace font">mono</button>
+    <button class="btn" id="btn-font-sans" data-tip="Sans-serif font">sans</button>
+    <button class="btn" id="btn-font-serif" data-tip="Serif font" data-tip-align="right">serif</button>
+  </div>
+  <div class="fld-label">Size</div>
+  <div class="row">
+    <button class="btn" id="btn-size-s" data-tip="Small">S</button>
+    <button class="btn" id="btn-size-m" data-tip="Medium">M</button>
+    <button class="btn" id="btn-size-l" data-tip="Large">L</button>
+    <button class="btn" id="btn-size-xl" data-tip="Extra large" data-tip-align="right">XL</button>
   </div>
 </div>
 
