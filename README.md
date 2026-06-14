@@ -1,4 +1,4 @@
-# Call Out Api - API Endpoint Overlay
+# CallOut Api - API Endpoint Overlay
 
 A Chrome extension that intercepts and displays all API calls made by a web page — overlaid directly on the site in a floating panel. Instantly see which network requests are happening, what triggered them, and inspect request/response payloads without opening DevTools.
 
