@@ -56,6 +56,24 @@ const expandedIds = new Set<number>();
 const selectorBadges = new Map<string, HTMLDivElement>();
 const selectorReqIds = new Map<string, number[]>();
 const selectorTimers = new Map<string, number>();
+
+// Reverse highlight: hover any page element that ever triggered a request →
+// flash its overlay row(s). selectorIndex maps each triggering element to every
+// request id captured for it. Selectors are resolved to elements once per
+// (lazy) rebuild, so the hover path is an O(DOM-depth) ancestor walk rather than
+// an O(selectors) closest() scan. A WeakMap so removed nodes aren't pinned.
+// The index is rebuilt only when the request set structurally changes, tracked
+// by comparing requestsRev (bumped on add/remove/selector-change) to the rev the
+// index was last built at — so pure mouse movement triggers no rebuilds.
+let selectorIndex = new WeakMap<Element, number[]>();
+let selectorIndexRev = -1;
+let requestsRev = 0;
+let revHighlightRows: HTMLElement[] = [];
+let revHoverActiveEl: Element | null = null;
+let revHoverTarget: Element | null = null;
+let revHoverRaf = 0;
+let pageHoverHandler: ((e: MouseEvent) => void) | null = null;
+let pageHoverOutHandler: ((e: MouseEvent) => void) | null = null;
 const detailTabs = new Map<number, DetailTab>();
 
 // filter state — multi-select sets (empty = pass-through)
@@ -115,6 +133,9 @@ let valueHighlightIndex = 0;
 let valueHighlightKey = '';
 let bulkHighlightEls: HTMLElement[] = [];
 let bulkHighlightRowId = -1;
+let jvHoverEls: HTMLElement[] = [];
+let jvHoverKey = '';
+let jvHoverTimer: ReturnType<typeof setTimeout> | null = null;
 
 // ── Preserve log (per-tab, survives in-tab navigations) ──────────────────────
 
@@ -210,6 +231,7 @@ function hydrateFromPreserved(onDone: () => void): void {
           if (pinnedKeys.has(pinKey(copy))) pinnedIds.add(localId);
           requests.set(localId, copy);
         }
+        requestsRev++;   // restored rows add new triggering-element mappings
         trimRequests();
       }
       onDone();
@@ -248,6 +270,7 @@ function cancelScheduledRender(): void {
 
 function trimRequests(): void {
   if (requests.size <= MAX_REQUESTS) return;
+  requestsRev++;   // evicting rows changes the triggering-element → id mapping
   const overflow = requests.size - MAX_REQUESTS;
   const iter = requests.keys();
   for (let i = 0; i < overflow; i++) {
@@ -303,7 +326,11 @@ window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
 
   if (requests.has(msg.id)) {
     const existing = requests.get(msg.id)!;
+    // element is re-evaluated on updates (e.g. the response emit), so the
+    // selector can change or drop — invalidate the index when it does.
+    const prevSel = existing.element?.selector;
     Object.assign(existing, msg);
+    if (msg.element !== undefined && existing.element?.selector !== prevSel) requestsRev++;
     refreshSearchCache(existing, msg);
     // sync pin by key
     const key = pinKey(existing);
@@ -317,6 +344,7 @@ window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
     const fresh = { ...msg } as ApiRequest;
     refreshSearchCache(fresh, msg);
     requests.set(msg.id, fresh);
+    requestsRev++;   // new triggering-element → id mapping
     // restore pin state from persisted keys
     if (pinnedKeys.has(pinKey(fresh))) pinnedIds.add(fresh.id);
     trimRequests();
@@ -360,12 +388,15 @@ chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, 
     }
     case 'clear':
       requests.clear();
+      requestsRev++;
       expandedIds.clear();
       detailTabs.clear();
       pinnedIds.clear();
       clearAllBadges();
       clearValueHighlights();
       clearBulkHighlights();
+      clearJvHover();
+      clearRevHighlight();
       clearPreserved();
       renderList();
       sendResponse({ ok: true });
@@ -772,12 +803,10 @@ function findMultipleValuesInDom(queries: Array<{value: string; kind: string}>):
   if (terms.length === 0) return [];
   const results: HTMLElement[] = [];
   const seenEls = new Set<HTMLElement>();
-  const ownedByOverlay = (el: Element | null): boolean =>
-    !!el && (!!el.closest('#ov-panel') || !!el.closest('#ov-pill') || el.classList.contains('ov-float-badge'));
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       const parent = node.parentElement;
-      if (!parent || ownedByOverlay(parent)) return NodeFilter.FILTER_REJECT;
+      if (!parent || isOverlayOwned(parent)) return NodeFilter.FILTER_REJECT;
       const tag = parent.tagName;
       if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return NodeFilter.FILTER_REJECT;
       return NodeFilter.FILTER_ACCEPT;
@@ -812,10 +841,8 @@ function findValuesInDom(value: string, kind: string): HTMLElement[] {
   if (trimmed.length < MIN_VALUE_LEN) return [];
   const results: HTMLElement[] = [];
   const seen = new Set<HTMLElement>();
-  const ownedByOverlay = (el: Element | null): boolean =>
-    !!el && (!!el.closest('#ov-panel') || !!el.closest('#ov-pill') || el.classList.contains('ov-float-badge'));
   const collect = (el: HTMLElement | null): boolean => {
-    if (!el || seen.has(el) || ownedByOverlay(el)) return true;
+    if (!el || seen.has(el) || isOverlayOwned(el)) return true;
     seen.add(el);
     results.push(el);
     return results.length < MAX_VALUE_HIGHLIGHTS;
@@ -826,7 +853,7 @@ function findValuesInDom(value: string, kind: string): HTMLElement[] {
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       const parent = node.parentElement;
-      if (!parent || ownedByOverlay(parent)) return NodeFilter.FILTER_REJECT;
+      if (!parent || isOverlayOwned(parent)) return NodeFilter.FILTER_REJECT;
       const tag = parent.tagName;
       if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return NodeFilter.FILTER_REJECT;
       return NodeFilter.FILTER_ACCEPT;
@@ -897,6 +924,36 @@ function clearBulkHighlights(): void {
   bulkHighlightRowId = -1;
 }
 
+function clearJvHover(): void {
+  if (jvHoverTimer !== null) { clearTimeout(jvHoverTimer); jvHoverTimer = null; }
+  for (const el of jvHoverEls) el.classList.remove('ov-value-hover');
+  jvHoverEls = [];
+  jvHoverKey = '';
+}
+
+// Preview-highlight the page elements matching a JSON value on hover. Kept
+// separate from the click selection (ov-value-match / valueHighlightEls) so
+// hovering never disturbs a pinned selection. Debounced because findValuesInDom
+// walks the DOM and the pointer can sweep across many .ov-jv spans.
+function runJvHover(jv: HTMLElement): void {
+  const row = jv.closest<HTMLElement>('.ov-row');
+  const rowId = row?.dataset.id || '';
+  const encVal = jv.dataset.ovVal || '';
+  const kind = jv.dataset.ovKind || 'string';
+  const key = `${rowId}|${kind}|${encVal}`;
+  if (key === jvHoverKey) return;            // already previewing this value
+  clearJvHover();
+  if (key === valueHighlightKey) return;     // already shown via click selection
+  jvHoverKey = key;
+  jvHoverTimer = setTimeout(() => {
+    jvHoverTimer = null;
+    if (jvHoverKey !== key) return;          // moved on before the timer fired
+    const matches = findValuesInDom(safeDecodeURIComponent(encVal), kind);
+    jvHoverEls = matches;
+    for (const el of matches) el.classList.add('ov-value-hover');
+  }, 120);
+}
+
 function runBulkHighlight(rowId: number): void {
   clearBulkHighlights();
   const req = requests.get(rowId);
@@ -930,6 +987,7 @@ function setValueStatusBadge(jv: HTMLElement, total: number, index: number): voi
 }
 
 function handleJsonValueClick(jv: HTMLElement): void {
+  clearJvHover();
   clearBulkHighlights();
   const row = jv.closest<HTMLElement>('.ov-row');
   const rowId = row?.dataset.id || '';
@@ -1275,6 +1333,7 @@ function renderList(): void {
   }
 
   reattachValueHighlight();
+  reattachRevHighlight();
   renderFooter();
 }
 
@@ -1300,6 +1359,14 @@ function bindListDelegation(list: HTMLElement): void {
   rowEventsBound = true;
 
   list.addEventListener('mouseover', (e: Event) => {
+    const jv = (e.target as Element).closest<HTMLElement>('.ov-jv');
+    if (jv && list.contains(jv)) {
+      const related = (e as MouseEvent).relatedTarget as Element | null;
+      if (related && jv.contains(related)) return;
+      clearHighlight();   // value preview takes over from the row→element highlight
+      runJvHover(jv);
+      return;
+    }
     const row = (e.target as Element).closest<HTMLElement>('.ov-row');
     if (!row || !list.contains(row)) return;
     const related = (e as MouseEvent).relatedTarget as Element | null;
@@ -1309,6 +1376,13 @@ function bindListDelegation(list: HTMLElement): void {
   });
 
   list.addEventListener('mouseout', (e: Event) => {
+    const jv = (e.target as Element).closest<HTMLElement>('.ov-jv');
+    if (jv) {
+      const related = (e as MouseEvent).relatedTarget as Element | null;
+      if (related && jv.contains(related)) return;
+      clearJvHover();
+      return;
+    }
     const row = (e.target as Element).closest<HTMLElement>('.ov-row');
     if (!row) return;
     const related = (e as MouseEvent).relatedTarget as Element | null;
@@ -1630,8 +1704,9 @@ function buildPanel(): void {
 
   if (ovCollapse) ovCollapse.onclick = () => setDockState('pill');
   if (ovClear) ovClear.onclick = () => {
-    requests.clear(); expandedIds.clear(); detailTabs.clear(); pinnedIds.clear();
+    requests.clear(); requestsRev++; expandedIds.clear(); detailTabs.clear(); pinnedIds.clear();
     clearAllBadges(); clearValueHighlights(); clearBulkHighlights();
+    clearJvHover(); clearRevHighlight();
     clearPreserved();
     renderList();
   };
@@ -1842,6 +1917,104 @@ function navigateToRequest(id: number): void {
     document.querySelector<HTMLElement>(`#ov-list .ov-row[data-id="${id}"]`)
       ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   });
+}
+
+function clearRevHighlight(): void {
+  for (const el of revHighlightRows) el.classList.remove('ov-row-rev-hl');
+  revHighlightRows = [];
+  revHoverActiveEl = null;
+}
+
+// Reverse of the row→element hover: highlight (and scroll into view) the overlay
+// rows for the requests a page element triggered. Returns the number of rows
+// actually highlighted — fewer than ids.length when some are filtered out of the
+// current list view.
+function showRevHighlight(ids: number[]): number {
+  clearRevHighlight();
+  const list = $('ov-list');
+  if (!list) return 0;
+  let first: HTMLElement | null = null;
+  for (const id of ids) {
+    const row = list.querySelector<HTMLElement>(`.ov-row[data-id="${id}"]`);
+    if (!row) continue;
+    row.classList.add('ov-row-rev-hl');
+    revHighlightRows.push(row);
+    if (!first) first = row;
+  }
+  if (first) first.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  return revHighlightRows.length;
+}
+
+// Re-apply the reverse highlight after renderList() rebuilds the row DOM (which
+// drops the ov-row-rev-hl class). Clearing revHoverActiveEl first forces
+// resolveRevHover to re-resolve rather than short-circuit on the unchanged element.
+function reattachRevHighlight(): void {
+  if (!revHoverActiveEl) return;
+  const el = revHoverActiveEl;
+  revHoverActiveEl = null;
+  resolveRevHover(el);
+}
+
+function isOverlayOwned(el: Element | null): boolean {
+  return !!el && (!!el.closest('#ov-panel') || !!el.closest('#ov-pill') || el.classList.contains('ov-float-badge'));
+}
+
+// Resolve every captured selector to its live element once, keyed by element so
+// the hover path is a cheap identity lookup. Selectors that no longer resolve
+// (element gone) are simply dropped; ids from distinct selectors that resolve to
+// the same element are merged.
+function rebuildSelectorIndex(): void {
+  selectorIndex = new WeakMap<Element, number[]>();
+  for (const [id, req] of requests) {
+    const sel = req.element?.selector;
+    if (!sel) continue;
+    let el: Element | null;
+    try { el = document.querySelector(sel); } catch { continue; }
+    if (!el || isOverlayOwned(el)) continue;
+    const arr = selectorIndex.get(el);
+    if (arr) arr.push(id); else selectorIndex.set(el, [id]);
+  }
+  selectorIndexRev = requestsRev;
+}
+
+// Map the hovered page element to the request(s) it triggered and flash their
+// rows. Walks up from the pointer; the first (nearest) ancestor in the index is
+// the deepest/most-specific triggering element, so it wins automatically.
+// Note: because elements are resolved at rebuild time, a silent SPA re-render
+// that replaces a triggering element without firing a new request will make the
+// reverse highlight go quiet for it until the next request — an accepted
+// trade-off for the cheap ancestor-walk lookup (vs. live closest() matching).
+function resolveRevHover(target: Element | null): void {
+  if (!activated || !$('ov-list')) return;
+  if (target && isOverlayOwned(target)) return;   // over the overlay → leave as-is
+  if (selectorIndexRev !== requestsRev) rebuildSelectorIndex();
+
+  for (let node: Element | null = target; node; node = node.parentElement) {
+    const ids = selectorIndex.get(node);
+    if (!ids) continue;
+    if (node === revHoverActiveEl) return;         // already flashing this element
+    // Only latch onto this element once at least one row is actually shown. When
+    // every triggering row is filtered out, leave revHoverActiveEl unset so a
+    // later filter change re-resolves on the next pointer move instead of
+    // short-circuiting on a stale "active" element with no visible highlight.
+    revHoverActiveEl = showRevHighlight(ids) > 0 ? node : null;
+    return;
+  }
+  clearRevHighlight();
+}
+
+function onPageHover(e: MouseEvent): void {
+  revHoverTarget = e.target instanceof Element ? e.target : null;
+  if (revHoverRaf) return;                          // coalesce to one pass per frame
+  revHoverRaf = requestAnimationFrame(() => {
+    revHoverRaf = 0;
+    resolveRevHover(revHoverTarget);
+  });
+}
+
+function onPageHoverOut(e: MouseEvent): void {
+  if (e.relatedTarget) return;                      // still inside the document
+  if (revHighlightRows.length) clearRevHighlight();
 }
 
 function flashBadge(req: ApiRequest): void {
@@ -2348,6 +2521,10 @@ function injectStyles(): void {
       align-items: start !important;
     }
     .ov-row.ov-pinned:not(.ov-expanded) { box-shadow: inset 2px 0 0 var(--ov-m-patch) !important; }
+    .ov-row.ov-row-rev-hl {
+      background: rgba(255,90,110,.14) !important;
+      box-shadow: inset 2px 0 0 var(--ov-s-err) !important;
+    }
 
     .ov-c {
       padding: 0 5px !important;
@@ -2753,6 +2930,10 @@ function injectStyles(): void {
       outline-offset: 2px !important;
       box-shadow: 0 0 0 4px rgba(106,176,255,.15) !important;
     }
+    .ov-value-hover {
+      outline: 1.5px dashed rgba(255,107,138,.55) !important;
+      outline-offset: 2px !important;
+    }
     .ov-value-match {
       outline: 1.5px dashed #ff6b8a !important;
       outline-offset: 2px !important;
@@ -3029,6 +3210,11 @@ function activateOverlay(): void {
   };
   document.addEventListener('click', clusterOutsideClickHandler, true);
 
+  pageHoverHandler = onPageHover;
+  pageHoverOutHandler = onPageHoverOut;
+  document.addEventListener('mouseover', pageHoverHandler, true);
+  document.addEventListener('mouseout', pageHoverOutHandler, true);
+
   if (document.body) init();
   else document.addEventListener('DOMContentLoaded', init, { once: true });
 }
@@ -3041,6 +3227,20 @@ function deactivateOverlay(): void {
     document.removeEventListener('click', clusterOutsideClickHandler, true);
     clusterOutsideClickHandler = null;
   }
+  if (pageHoverHandler) {
+    document.removeEventListener('mouseover', pageHoverHandler, true);
+    pageHoverHandler = null;
+  }
+  if (pageHoverOutHandler) {
+    document.removeEventListener('mouseout', pageHoverOutHandler, true);
+    pageHoverOutHandler = null;
+  }
+  if (revHoverRaf) { cancelAnimationFrame(revHoverRaf); revHoverRaf = 0; }
+  revHoverTarget = null;
+  selectorIndex = new WeakMap();
+  selectorIndexRev = -1;
+  requestsRev = 0;
+  clearRevHighlight();
   signalInjected('stop');
   cancelScheduledRender();
   // NOTE: do NOT clearPreserved() here — deactivation can fire from a transient
@@ -3059,6 +3259,7 @@ function deactivateOverlay(): void {
   clearAllBadges();
   clearValueHighlights();
   clearBulkHighlights();
+  clearJvHover();
   requests.clear();
   expandedIds.clear();
   detailTabs.clear();
