@@ -28,9 +28,16 @@ interface XMLHttpRequest {
   let stopped = false;
 
   const TEXTLIKE_CT = /^(?:text\/|application\/(?:json|ld\+json|xml|x-www-form-urlencoded|graphql|javascript|x-ndjson)|application\/.*\+json)/i;
-  const MAX_BODY_BYTES = 50_000;
+  // Upper bound on a single captured request/response body. Set high enough to
+  // show full API responses rather than a truncated preview; the ceiling only
+  // exists so a pathological multi-MB or never-ending text stream can't be
+  // accumulated into memory and freeze the tab. Bodies beyond it are still
+  // rendered as a recovered partial tree (see parsePartialJson in content.ts).
+  const MAX_BODY_BYTES = 25_000_000;
   const MAX_WS_BODY_BYTES = 10_000;
-  const MAX_INSPECTED_BODY = 1_000_000;
+  // Skip reading a body whose content-length already exceeds the cap — no point
+  // streaming bytes we'd only discard. Kept in lockstep with MAX_BODY_BYTES.
+  const MAX_INSPECTED_BODY = MAX_BODY_BYTES;
   const INTERACT_WINDOW_MS = 800;
   const MAX_HEADERS = 100;
   const MAX_HEADER_VALUE = 2_000;

@@ -48,6 +48,16 @@ const RENDER_LIMIT = 200;
 const RENDER_THROTTLE_MS = 100;
 const MAX_JSON_LEAF_LEN = 1000;
 const MAX_VALUE_HIGHLIGHTS = 50;
+// Display/scan bounds for very large bodies (the captured-body cap in injected.ts
+// is now high enough to admit multi-MB JSON). flattenJsonRows and collectJsonLeaves
+// both materialize their whole output eagerly on the main thread, so cap them to
+// keep expanding a huge response from janking the UI.
+const MAX_JSON_ROWS = 20_000;
+const MAX_JSON_LEAVES = 2_000;
+// Per-body cap for the preserve-log copy only (display keeps the full body).
+// chrome.storage.session has a ~10MB quota; one oversized body would make the
+// whole tab's persist fail, dropping every preserved request — so trim the copy.
+const MAX_PRESERVED_BODY_BYTES = 256_000;
 const MIN_VALUE_LEN = 2;
 const MIN_SUBSTRING_LEN = 4;
 
@@ -56,6 +66,24 @@ const expandedIds = new Set<number>();
 const selectorBadges = new Map<string, HTMLDivElement>();
 const selectorReqIds = new Map<string, number[]>();
 const selectorTimers = new Map<string, number>();
+
+// Reverse highlight: hover any page element that ever triggered a request →
+// flash its overlay row(s). selectorIndex maps each triggering element to every
+// request id captured for it. Selectors are resolved to elements once per
+// (lazy) rebuild, so the hover path is an O(DOM-depth) ancestor walk rather than
+// an O(selectors) closest() scan. A WeakMap so removed nodes aren't pinned.
+// The index is rebuilt only when the request set structurally changes, tracked
+// by comparing requestsRev (bumped on add/remove/selector-change) to the rev the
+// index was last built at — so pure mouse movement triggers no rebuilds.
+let selectorIndex = new WeakMap<Element, number[]>();
+let selectorIndexRev = -1;
+let requestsRev = 0;
+let revHighlightRows: HTMLElement[] = [];
+let revHoverActiveEl: Element | null = null;
+let revHoverTarget: Element | null = null;
+let revHoverRaf = 0;
+let pageHoverHandler: ((e: MouseEvent) => void) | null = null;
+let pageHoverOutHandler: ((e: MouseEvent) => void) | null = null;
 const detailTabs = new Map<number, DetailTab>();
 
 // filter state — multi-select sets (empty = pass-through)
@@ -115,6 +143,9 @@ let valueHighlightIndex = 0;
 let valueHighlightKey = '';
 let bulkHighlightEls: HTMLElement[] = [];
 let bulkHighlightRowId = -1;
+let jvHoverEls: HTMLElement[] = [];
+let jvHoverKey = '';
+let jvHoverTimer: ReturnType<typeof setTimeout> | null = null;
 
 // ── Preserve log (per-tab, survives in-tab navigations) ──────────────────────
 
@@ -143,6 +174,26 @@ function markWsMessagePending(wsId: number, m: WsMessage): void {
   schedulePreserveFlush();
 }
 
+// The display copy keeps the full captured body, but the persisted copy goes to
+// chrome.storage.session (~10MB quota for the whole tab). A single oversized body
+// would make the whole set() fail and drop every preserved request, so return a
+// shallow clone with over-cap bodies trimmed. Also drops the derived lowercase
+// search caches — hydrateFromPreserved rebuilds them, and they'd otherwise double
+// the persisted body size.
+function trimForPreserve(r: ApiRequest): ApiRequest {
+  const copy: ApiRequest = { ...r };
+  delete copy._lcUrl;
+  delete copy._lcReqBody;
+  delete copy._lcResBody;
+  if (copy.resBody != null && copy.resBody.length > MAX_PRESERVED_BODY_BYTES) {
+    copy.resBody = `${copy.resBody.slice(0, MAX_PRESERVED_BODY_BYTES)}…[trimmed for storage]`;
+  }
+  if (copy.reqBody != null && copy.reqBody.length > MAX_PRESERVED_BODY_BYTES) {
+    copy.reqBody = `${copy.reqBody.slice(0, MAX_PRESERVED_BODY_BYTES)}…[trimmed for storage]`;
+  }
+  return copy;
+}
+
 function flushPreserve(): void {
   preserveTimer = null;
   if (!dirtyPreserveIds.size && !pendingWsMessages.size) return;
@@ -150,7 +201,7 @@ function flushPreserve(): void {
   const reqs: ApiRequest[] = [];
   for (const id of dirtyPreserveIds) {
     const r = requests.get(id);
-    if (r) reqs.push(r);
+    if (r) reqs.push(trimForPreserve(r));
   }
   dirtyPreserveIds.clear();
 
@@ -210,6 +261,7 @@ function hydrateFromPreserved(onDone: () => void): void {
           if (pinnedKeys.has(pinKey(copy))) pinnedIds.add(localId);
           requests.set(localId, copy);
         }
+        requestsRev++;   // restored rows add new triggering-element mappings
         trimRequests();
       }
       onDone();
@@ -248,6 +300,7 @@ function cancelScheduledRender(): void {
 
 function trimRequests(): void {
   if (requests.size <= MAX_REQUESTS) return;
+  requestsRev++;   // evicting rows changes the triggering-element → id mapping
   const overflow = requests.size - MAX_REQUESTS;
   const iter = requests.keys();
   for (let i = 0; i < overflow; i++) {
@@ -303,7 +356,11 @@ window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
 
   if (requests.has(msg.id)) {
     const existing = requests.get(msg.id)!;
+    // element is re-evaluated on updates (e.g. the response emit), so the
+    // selector can change or drop — invalidate the index when it does.
+    const prevSel = existing.element?.selector;
     Object.assign(existing, msg);
+    if (msg.element !== undefined && existing.element?.selector !== prevSel) requestsRev++;
     refreshSearchCache(existing, msg);
     // sync pin by key
     const key = pinKey(existing);
@@ -317,6 +374,7 @@ window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
     const fresh = { ...msg } as ApiRequest;
     refreshSearchCache(fresh, msg);
     requests.set(msg.id, fresh);
+    requestsRev++;   // new triggering-element → id mapping
     // restore pin state from persisted keys
     if (pinnedKeys.has(pinKey(fresh))) pinnedIds.add(fresh.id);
     trimRequests();
@@ -360,12 +418,15 @@ chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, 
     }
     case 'clear':
       requests.clear();
+      requestsRev++;
       expandedIds.clear();
       detailTabs.clear();
       pinnedIds.clear();
       clearAllBadges();
       clearValueHighlights();
       clearBulkHighlights();
+      clearJvHover();
+      clearRevHighlight();
       clearPreserved();
       renderList();
       sendResponse({ ok: true });
@@ -509,18 +570,156 @@ function pinKey(req: ApiRequest): string {
 
 function formatBody(text: string | null | undefined): string {
   if (!text) return '';
-  const t = text.trimStart();
-  if (t.startsWith('{') || t.startsWith('[')) {
-    try { return JSON.stringify(JSON.parse(text), null, 2); } catch { /* fall through */ }
-  }
+  const parsed = parseJsonBody(text);
+  if (parsed !== undefined) return JSON.stringify(parsed.value, null, 2);
   return text;
 }
 
 function tryParseJsonContainer(text: string | null | undefined): unknown | undefined {
+  return parseJsonBody(text)?.value;
+}
+
+// Parse a response/request body that is a JSON object or array. Returns the
+// value plus a `truncated` flag. injected.ts caps bodies at MAX_BODY_BYTES (a
+// high ceiling that shows full API responses); a body large enough to hit it is
+// cut mid-token and breaks strict JSON.parse — in that case we fall back to a
+// tolerant parser that recovers the largest well-formed prefix, so the response
+// still renders as the indented tree instead of a compact raw blob.
+function parseJsonBody(text: string | null | undefined): { value: unknown; truncated: boolean } | undefined {
   if (!text) return undefined;
   const t = text.trimStart();
   if (!t.startsWith('{') && !t.startsWith('[')) return undefined;
-  try { return JSON.parse(text); } catch { return undefined; }
+  try { return { value: JSON.parse(text), truncated: false }; } catch { /* fall through */ }
+  const partial = parsePartialJson(t);
+  return partial === undefined ? undefined : { value: partial, truncated: true };
+}
+
+// Recursive-descent JSON parser that tolerates end-of-input at any point: an
+// unfinished string is kept as far as it was read, an unfinished object/array
+// drops only its incomplete trailing element, and an unfinished value is
+// discarded. Used only as a fallback for truncated bodies.
+function parsePartialJson(src: string): unknown | undefined {
+  let i = 0;
+  const n = src.length;
+  const EOF = Symbol('eof');
+
+  function skipWs(): void {
+    while (i < n) {
+      const c = src.charCodeAt(i);
+      if (c === 32 || c === 9 || c === 10 || c === 13) i++;
+      else break;
+    }
+  }
+
+  function parseString(): string {
+    i++; // opening quote
+    let out = '';
+    while (i < n) {
+      const ch = src[i++];
+      if (ch === '\\') {
+        if (i >= n) break; // truncated escape
+        const e = src[i++];
+        switch (e) {
+          case '"': out += '"'; break;
+          case '\\': out += '\\'; break;
+          case '/': out += '/'; break;
+          case 'b': out += '\b'; break;
+          case 'f': out += '\f'; break;
+          case 'n': out += '\n'; break;
+          case 'r': out += '\r'; break;
+          case 't': out += '\t'; break;
+          case 'u': {
+            if (i + 4 <= n) {
+              const code = parseInt(src.slice(i, i + 4), 16);
+              if (!Number.isNaN(code)) { out += String.fromCharCode(code); i += 4; }
+            } else { i = n; }
+            break;
+          }
+          default: out += e;
+        }
+      } else if (ch === '"') {
+        return out;
+      } else {
+        out += ch;
+      }
+    }
+    return out; // truncated mid-string
+  }
+
+  function parseNumber(): number | typeof EOF {
+    const start = i;
+    if (src[i] === '-') i++;
+    while (i < n && '0123456789.eE+-'.includes(src[i])) i++;
+    // A number that runs right up to end-of-input has no delimiter after it, so
+    // it was cut mid-token (e.g. "12345" truncated to "123") — drop it rather
+    // than surface a wrong value.
+    if (i >= n) return EOF;
+    const num = Number(src.slice(start, i));
+    return Number.isNaN(num) ? EOF : num;
+  }
+
+  function parseKeyword(word: string, value: unknown): unknown | typeof EOF {
+    if (!src.startsWith(word, i)) return EOF;
+    i += word.length;
+    return value;
+  }
+
+  function parseValue(): unknown | typeof EOF {
+    skipWs();
+    if (i >= n) return EOF;
+    const ch = src[i];
+    if (ch === '{') return parseObject();
+    if (ch === '[') return parseArray();
+    if (ch === '"') return parseString();
+    if (ch === '-' || (ch >= '0' && ch <= '9')) return parseNumber();
+    if (ch === 't') return parseKeyword('true', true);
+    if (ch === 'f') return parseKeyword('false', false);
+    if (ch === 'n') return parseKeyword('null', null);
+    return EOF; // unexpected/truncated token
+  }
+
+  function parseObject(): Record<string, unknown> {
+    i++; // '{'
+    const obj: Record<string, unknown> = {};
+    while (true) {
+      skipWs();
+      if (i >= n) return obj;
+      if (src[i] === '}') { i++; return obj; }
+      if (src[i] === ',') { i++; continue; }
+      if (src[i] !== '"') return obj; // truncated/malformed key
+      const key = parseString();
+      skipWs();
+      if (i >= n || src[i] !== ':') return obj; // no colon → drop incomplete pair
+      i++; // ':'
+      const val = parseValue();
+      if (val === EOF) return obj; // truncated value → drop incomplete pair
+      obj[key] = val;
+    }
+  }
+
+  function parseArray(): unknown[] {
+    i++; // '['
+    const arr: unknown[] = [];
+    while (true) {
+      skipWs();
+      if (i >= n) return arr;
+      if (src[i] === ']') { i++; return arr; }
+      if (src[i] === ',') { i++; continue; }
+      const val = parseValue();
+      if (val === EOF) return arr; // truncated element
+      arr.push(val);
+    }
+  }
+
+  const root = parseValue();
+  if (root === EOF) return undefined;
+  // A clean truncation consumes everything up to the cut point. Leftover
+  // non-whitespace means the parser stopped on mid-body garbage (malformed,
+  // not truncated) — reject so the caller shows the raw body instead of a
+  // misleadingly "recovered" empty/partial tree.
+  skipWs();
+  if (i < n) return undefined;
+  return root;
 }
 
 function isError(r: ApiRequest): boolean {
@@ -559,6 +758,7 @@ function statusBucket(req: ApiRequest): string {
 function collectJsonLeaves(root: unknown, out: Array<{value: string; kind: string}>): void {
   const seen = new Set<string>();
   function walk(value: unknown): void {
+    if (out.length >= MAX_JSON_LEAVES) return; // bound work on very large bodies
     if (value === null || typeof value === 'boolean') return;
     const t = typeof value;
     if (t === 'string') {
@@ -595,7 +795,9 @@ function flattenJsonRows(value: unknown): JsonRow[] {
   const keySeg = (k: string | null): JsonSeg[] =>
     k === null ? [] : [textSeg(`<span class="ov-jk">"${escHtml(k)}"</span>: `)];
 
+  let capped = false;
   function walk(v: unknown, depth: number, key: string | null, trailing: boolean): void {
+    if (rows.length >= MAX_JSON_ROWS) { capped = true; return; }
     if (v === null) {
       rows.push({ depth, segs: [...keySeg(key), leafSeg('null', 'null', 'null'), ...commaSeg(trailing)] });
       return;
@@ -641,6 +843,9 @@ function flattenJsonRows(value: unknown): JsonRow[] {
     } catch { /* skip */ }
   }
   walk(value, 0, null, false);
+  if (capped) {
+    rows.push({ depth: 0, segs: [textSeg(`<span class="ov-jk">… ${MAX_JSON_ROWS.toLocaleString()}+ lines — display capped</span>`)] });
+  }
   return rows;
 }
 
@@ -772,12 +977,10 @@ function findMultipleValuesInDom(queries: Array<{value: string; kind: string}>):
   if (terms.length === 0) return [];
   const results: HTMLElement[] = [];
   const seenEls = new Set<HTMLElement>();
-  const ownedByOverlay = (el: Element | null): boolean =>
-    !!el && (!!el.closest('#ov-panel') || !!el.closest('#ov-pill') || el.classList.contains('ov-float-badge'));
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       const parent = node.parentElement;
-      if (!parent || ownedByOverlay(parent)) return NodeFilter.FILTER_REJECT;
+      if (!parent || isOverlayOwned(parent)) return NodeFilter.FILTER_REJECT;
       const tag = parent.tagName;
       if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return NodeFilter.FILTER_REJECT;
       return NodeFilter.FILTER_ACCEPT;
@@ -812,10 +1015,8 @@ function findValuesInDom(value: string, kind: string): HTMLElement[] {
   if (trimmed.length < MIN_VALUE_LEN) return [];
   const results: HTMLElement[] = [];
   const seen = new Set<HTMLElement>();
-  const ownedByOverlay = (el: Element | null): boolean =>
-    !!el && (!!el.closest('#ov-panel') || !!el.closest('#ov-pill') || el.classList.contains('ov-float-badge'));
   const collect = (el: HTMLElement | null): boolean => {
-    if (!el || seen.has(el) || ownedByOverlay(el)) return true;
+    if (!el || seen.has(el) || isOverlayOwned(el)) return true;
     seen.add(el);
     results.push(el);
     return results.length < MAX_VALUE_HIGHLIGHTS;
@@ -826,7 +1027,7 @@ function findValuesInDom(value: string, kind: string): HTMLElement[] {
   const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       const parent = node.parentElement;
-      if (!parent || ownedByOverlay(parent)) return NodeFilter.FILTER_REJECT;
+      if (!parent || isOverlayOwned(parent)) return NodeFilter.FILTER_REJECT;
       const tag = parent.tagName;
       if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return NodeFilter.FILTER_REJECT;
       return NodeFilter.FILTER_ACCEPT;
@@ -897,6 +1098,36 @@ function clearBulkHighlights(): void {
   bulkHighlightRowId = -1;
 }
 
+function clearJvHover(): void {
+  if (jvHoverTimer !== null) { clearTimeout(jvHoverTimer); jvHoverTimer = null; }
+  for (const el of jvHoverEls) el.classList.remove('ov-value-hover');
+  jvHoverEls = [];
+  jvHoverKey = '';
+}
+
+// Preview-highlight the page elements matching a JSON value on hover. Kept
+// separate from the click selection (ov-value-match / valueHighlightEls) so
+// hovering never disturbs a pinned selection. Debounced because findValuesInDom
+// walks the DOM and the pointer can sweep across many .ov-jv spans.
+function runJvHover(jv: HTMLElement): void {
+  const row = jv.closest<HTMLElement>('.ov-row');
+  const rowId = row?.dataset.id || '';
+  const encVal = jv.dataset.ovVal || '';
+  const kind = jv.dataset.ovKind || 'string';
+  const key = `${rowId}|${kind}|${encVal}`;
+  if (key === jvHoverKey) return;            // already previewing this value
+  clearJvHover();
+  if (key === valueHighlightKey) return;     // already shown via click selection
+  jvHoverKey = key;
+  jvHoverTimer = setTimeout(() => {
+    jvHoverTimer = null;
+    if (jvHoverKey !== key) return;          // moved on before the timer fired
+    const matches = findValuesInDom(safeDecodeURIComponent(encVal), kind);
+    jvHoverEls = matches;
+    for (const el of matches) el.classList.add('ov-value-hover');
+  }, 120);
+}
+
 function runBulkHighlight(rowId: number): void {
   clearBulkHighlights();
   const req = requests.get(rowId);
@@ -930,6 +1161,7 @@ function setValueStatusBadge(jv: HTMLElement, total: number, index: number): voi
 }
 
 function handleJsonValueClick(jv: HTMLElement): void {
+  clearJvHover();
   clearBulkHighlights();
   const row = jv.closest<HTMLElement>('.ov-row');
   const rowId = row?.dataset.id || '';
@@ -1028,9 +1260,12 @@ function detailPanelHtml(req: ApiRequest): string {
   if (activeTab === 'response') {
     let resBodyHtml: string;
     if (req.resBody != null) {
-      const parsed = tryParseJsonContainer(req.resBody);
+      const parsed = parseJsonBody(req.resBody);
+      const truncNote = parsed?.truncated
+        ? '<div class="ov-trunc-note">⚠ response truncated — showing recovered partial body</div>'
+        : '';
       resBodyHtml = parsed !== undefined
-        ? `<div class="ov-body-json" data-id="${req.id}"></div>`
+        ? `${truncNote}<div class="ov-body-json" data-id="${req.id}"></div>`
         : `<pre class="ov-body-pre">${escHtml(formatBody(req.resBody).slice(0, 3000))}</pre>`;
     } else if (req.status === 'pending') {
       resBodyHtml = '<div class="ov-body-none">Waiting…</div>';
@@ -1275,6 +1510,7 @@ function renderList(): void {
   }
 
   reattachValueHighlight();
+  reattachRevHighlight();
   renderFooter();
 }
 
@@ -1300,6 +1536,14 @@ function bindListDelegation(list: HTMLElement): void {
   rowEventsBound = true;
 
   list.addEventListener('mouseover', (e: Event) => {
+    const jv = (e.target as Element).closest<HTMLElement>('.ov-jv');
+    if (jv && list.contains(jv)) {
+      const related = (e as MouseEvent).relatedTarget as Element | null;
+      if (related && jv.contains(related)) return;
+      clearHighlight();   // value preview takes over from the row→element highlight
+      runJvHover(jv);
+      return;
+    }
     const row = (e.target as Element).closest<HTMLElement>('.ov-row');
     if (!row || !list.contains(row)) return;
     const related = (e as MouseEvent).relatedTarget as Element | null;
@@ -1309,6 +1553,13 @@ function bindListDelegation(list: HTMLElement): void {
   });
 
   list.addEventListener('mouseout', (e: Event) => {
+    const jv = (e.target as Element).closest<HTMLElement>('.ov-jv');
+    if (jv) {
+      const related = (e as MouseEvent).relatedTarget as Element | null;
+      if (related && jv.contains(related)) return;
+      clearJvHover();
+      return;
+    }
     const row = (e.target as Element).closest<HTMLElement>('.ov-row');
     if (!row) return;
     const related = (e as MouseEvent).relatedTarget as Element | null;
@@ -1414,6 +1665,10 @@ function bindListDelegation(list: HTMLElement): void {
 
     const row = target.closest<HTMLElement>('.ov-row');
     if (!row) return;
+    // The detail panel is rendered inside .ov-row, so a click on its body (not on
+    // a tab/copy/value control handled above) would otherwise bubble here and
+    // collapse the row. Only the summary header toggles expansion.
+    if (target.closest('.ov-detail')) return;
     const id = Number(row.dataset.id);
     if (expandedIds.has(id)) {
       expandedIds.delete(id);
@@ -1630,8 +1885,9 @@ function buildPanel(): void {
 
   if (ovCollapse) ovCollapse.onclick = () => setDockState('pill');
   if (ovClear) ovClear.onclick = () => {
-    requests.clear(); expandedIds.clear(); detailTabs.clear(); pinnedIds.clear();
+    requests.clear(); requestsRev++; expandedIds.clear(); detailTabs.clear(); pinnedIds.clear();
     clearAllBadges(); clearValueHighlights(); clearBulkHighlights();
+    clearJvHover(); clearRevHighlight();
     clearPreserved();
     renderList();
   };
@@ -1842,6 +2098,104 @@ function navigateToRequest(id: number): void {
     document.querySelector<HTMLElement>(`#ov-list .ov-row[data-id="${id}"]`)
       ?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   });
+}
+
+function clearRevHighlight(): void {
+  for (const el of revHighlightRows) el.classList.remove('ov-row-rev-hl');
+  revHighlightRows = [];
+  revHoverActiveEl = null;
+}
+
+// Reverse of the row→element hover: highlight (and scroll into view) the overlay
+// rows for the requests a page element triggered. Returns the number of rows
+// actually highlighted — fewer than ids.length when some are filtered out of the
+// current list view.
+function showRevHighlight(ids: number[]): number {
+  clearRevHighlight();
+  const list = $('ov-list');
+  if (!list) return 0;
+  let first: HTMLElement | null = null;
+  for (const id of ids) {
+    const row = list.querySelector<HTMLElement>(`.ov-row[data-id="${id}"]`);
+    if (!row) continue;
+    row.classList.add('ov-row-rev-hl');
+    revHighlightRows.push(row);
+    if (!first) first = row;
+  }
+  if (first) first.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  return revHighlightRows.length;
+}
+
+// Re-apply the reverse highlight after renderList() rebuilds the row DOM (which
+// drops the ov-row-rev-hl class). Clearing revHoverActiveEl first forces
+// resolveRevHover to re-resolve rather than short-circuit on the unchanged element.
+function reattachRevHighlight(): void {
+  if (!revHoverActiveEl) return;
+  const el = revHoverActiveEl;
+  revHoverActiveEl = null;
+  resolveRevHover(el);
+}
+
+function isOverlayOwned(el: Element | null): boolean {
+  return !!el && (!!el.closest('#ov-panel') || !!el.closest('#ov-pill') || el.classList.contains('ov-float-badge'));
+}
+
+// Resolve every captured selector to its live element once, keyed by element so
+// the hover path is a cheap identity lookup. Selectors that no longer resolve
+// (element gone) are simply dropped; ids from distinct selectors that resolve to
+// the same element are merged.
+function rebuildSelectorIndex(): void {
+  selectorIndex = new WeakMap<Element, number[]>();
+  for (const [id, req] of requests) {
+    const sel = req.element?.selector;
+    if (!sel) continue;
+    let el: Element | null;
+    try { el = document.querySelector(sel); } catch { continue; }
+    if (!el || isOverlayOwned(el)) continue;
+    const arr = selectorIndex.get(el);
+    if (arr) arr.push(id); else selectorIndex.set(el, [id]);
+  }
+  selectorIndexRev = requestsRev;
+}
+
+// Map the hovered page element to the request(s) it triggered and flash their
+// rows. Walks up from the pointer; the first (nearest) ancestor in the index is
+// the deepest/most-specific triggering element, so it wins automatically.
+// Note: because elements are resolved at rebuild time, a silent SPA re-render
+// that replaces a triggering element without firing a new request will make the
+// reverse highlight go quiet for it until the next request — an accepted
+// trade-off for the cheap ancestor-walk lookup (vs. live closest() matching).
+function resolveRevHover(target: Element | null): void {
+  if (!activated || !$('ov-list')) return;
+  if (target && isOverlayOwned(target)) return;   // over the overlay → leave as-is
+  if (selectorIndexRev !== requestsRev) rebuildSelectorIndex();
+
+  for (let node: Element | null = target; node; node = node.parentElement) {
+    const ids = selectorIndex.get(node);
+    if (!ids) continue;
+    if (node === revHoverActiveEl) return;         // already flashing this element
+    // Only latch onto this element once at least one row is actually shown. When
+    // every triggering row is filtered out, leave revHoverActiveEl unset so a
+    // later filter change re-resolves on the next pointer move instead of
+    // short-circuiting on a stale "active" element with no visible highlight.
+    revHoverActiveEl = showRevHighlight(ids) > 0 ? node : null;
+    return;
+  }
+  clearRevHighlight();
+}
+
+function onPageHover(e: MouseEvent): void {
+  revHoverTarget = e.target instanceof Element ? e.target : null;
+  if (revHoverRaf) return;                          // coalesce to one pass per frame
+  revHoverRaf = requestAnimationFrame(() => {
+    revHoverRaf = 0;
+    resolveRevHover(revHoverTarget);
+  });
+}
+
+function onPageHoverOut(e: MouseEvent): void {
+  if (e.relatedTarget) return;                      // still inside the document
+  if (revHighlightRows.length) clearRevHighlight();
 }
 
 function flashBadge(req: ApiRequest): void {
@@ -2348,6 +2702,10 @@ function injectStyles(): void {
       align-items: start !important;
     }
     .ov-row.ov-pinned:not(.ov-expanded) { box-shadow: inset 2px 0 0 var(--ov-m-patch) !important; }
+    .ov-row.ov-row-rev-hl {
+      background: rgba(255,90,110,.14) !important;
+      box-shadow: inset 2px 0 0 var(--ov-s-err) !important;
+    }
 
     .ov-c {
       padding: 0 5px !important;
@@ -2510,6 +2868,12 @@ function injectStyles(): void {
     }
     .ov-body-pre::-webkit-scrollbar { width: 8px !important; }
     .ov-body-pre::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; }
+    .ov-trunc-note {
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-s-4xx) !important;
+      margin-bottom: 4px !important;
+      letter-spacing: .02em !important;
+    }
     .ov-body-json {
       display: block !important;
       background: var(--ov-bg) !important;
@@ -2752,6 +3116,10 @@ function injectStyles(): void {
       outline: 2px solid #6ab0ff !important;
       outline-offset: 2px !important;
       box-shadow: 0 0 0 4px rgba(106,176,255,.15) !important;
+    }
+    .ov-value-hover {
+      outline: 1.5px dashed rgba(255,107,138,.55) !important;
+      outline-offset: 2px !important;
     }
     .ov-value-match {
       outline: 1.5px dashed #ff6b8a !important;
@@ -3029,6 +3397,11 @@ function activateOverlay(): void {
   };
   document.addEventListener('click', clusterOutsideClickHandler, true);
 
+  pageHoverHandler = onPageHover;
+  pageHoverOutHandler = onPageHoverOut;
+  document.addEventListener('mouseover', pageHoverHandler, true);
+  document.addEventListener('mouseout', pageHoverOutHandler, true);
+
   if (document.body) init();
   else document.addEventListener('DOMContentLoaded', init, { once: true });
 }
@@ -3041,6 +3414,20 @@ function deactivateOverlay(): void {
     document.removeEventListener('click', clusterOutsideClickHandler, true);
     clusterOutsideClickHandler = null;
   }
+  if (pageHoverHandler) {
+    document.removeEventListener('mouseover', pageHoverHandler, true);
+    pageHoverHandler = null;
+  }
+  if (pageHoverOutHandler) {
+    document.removeEventListener('mouseout', pageHoverOutHandler, true);
+    pageHoverOutHandler = null;
+  }
+  if (revHoverRaf) { cancelAnimationFrame(revHoverRaf); revHoverRaf = 0; }
+  revHoverTarget = null;
+  selectorIndex = new WeakMap();
+  selectorIndexRev = -1;
+  requestsRev = 0;
+  clearRevHighlight();
   signalInjected('stop');
   cancelScheduledRender();
   // NOTE: do NOT clearPreserved() here — deactivation can fire from a transient
@@ -3059,6 +3446,7 @@ function deactivateOverlay(): void {
   clearAllBadges();
   clearValueHighlights();
   clearBulkHighlights();
+  clearJvHover();
   requests.clear();
   expandedIds.clear();
   detailTabs.clear();
