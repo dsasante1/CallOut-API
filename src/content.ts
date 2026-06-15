@@ -48,6 +48,16 @@ const RENDER_LIMIT = 200;
 const RENDER_THROTTLE_MS = 100;
 const MAX_JSON_LEAF_LEN = 1000;
 const MAX_VALUE_HIGHLIGHTS = 50;
+// Display/scan bounds for very large bodies (the captured-body cap in injected.ts
+// is now high enough to admit multi-MB JSON). flattenJsonRows and collectJsonLeaves
+// both materialize their whole output eagerly on the main thread, so cap them to
+// keep expanding a huge response from janking the UI.
+const MAX_JSON_ROWS = 20_000;
+const MAX_JSON_LEAVES = 2_000;
+// Per-body cap for the preserve-log copy only (display keeps the full body).
+// chrome.storage.session has a ~10MB quota; one oversized body would make the
+// whole tab's persist fail, dropping every preserved request — so trim the copy.
+const MAX_PRESERVED_BODY_BYTES = 256_000;
 const MIN_VALUE_LEN = 2;
 const MIN_SUBSTRING_LEN = 4;
 
@@ -164,6 +174,26 @@ function markWsMessagePending(wsId: number, m: WsMessage): void {
   schedulePreserveFlush();
 }
 
+// The display copy keeps the full captured body, but the persisted copy goes to
+// chrome.storage.session (~10MB quota for the whole tab). A single oversized body
+// would make the whole set() fail and drop every preserved request, so return a
+// shallow clone with over-cap bodies trimmed. Also drops the derived lowercase
+// search caches — hydrateFromPreserved rebuilds them, and they'd otherwise double
+// the persisted body size.
+function trimForPreserve(r: ApiRequest): ApiRequest {
+  const copy: ApiRequest = { ...r };
+  delete copy._lcUrl;
+  delete copy._lcReqBody;
+  delete copy._lcResBody;
+  if (copy.resBody != null && copy.resBody.length > MAX_PRESERVED_BODY_BYTES) {
+    copy.resBody = `${copy.resBody.slice(0, MAX_PRESERVED_BODY_BYTES)}…[trimmed for storage]`;
+  }
+  if (copy.reqBody != null && copy.reqBody.length > MAX_PRESERVED_BODY_BYTES) {
+    copy.reqBody = `${copy.reqBody.slice(0, MAX_PRESERVED_BODY_BYTES)}…[trimmed for storage]`;
+  }
+  return copy;
+}
+
 function flushPreserve(): void {
   preserveTimer = null;
   if (!dirtyPreserveIds.size && !pendingWsMessages.size) return;
@@ -171,7 +201,7 @@ function flushPreserve(): void {
   const reqs: ApiRequest[] = [];
   for (const id of dirtyPreserveIds) {
     const r = requests.get(id);
-    if (r) reqs.push(r);
+    if (r) reqs.push(trimForPreserve(r));
   }
   dirtyPreserveIds.clear();
 
@@ -540,18 +570,156 @@ function pinKey(req: ApiRequest): string {
 
 function formatBody(text: string | null | undefined): string {
   if (!text) return '';
-  const t = text.trimStart();
-  if (t.startsWith('{') || t.startsWith('[')) {
-    try { return JSON.stringify(JSON.parse(text), null, 2); } catch { /* fall through */ }
-  }
+  const parsed = parseJsonBody(text);
+  if (parsed !== undefined) return JSON.stringify(parsed.value, null, 2);
   return text;
 }
 
 function tryParseJsonContainer(text: string | null | undefined): unknown | undefined {
+  return parseJsonBody(text)?.value;
+}
+
+// Parse a response/request body that is a JSON object or array. Returns the
+// value plus a `truncated` flag. injected.ts caps bodies at MAX_BODY_BYTES (a
+// high ceiling that shows full API responses); a body large enough to hit it is
+// cut mid-token and breaks strict JSON.parse — in that case we fall back to a
+// tolerant parser that recovers the largest well-formed prefix, so the response
+// still renders as the indented tree instead of a compact raw blob.
+function parseJsonBody(text: string | null | undefined): { value: unknown; truncated: boolean } | undefined {
   if (!text) return undefined;
   const t = text.trimStart();
   if (!t.startsWith('{') && !t.startsWith('[')) return undefined;
-  try { return JSON.parse(text); } catch { return undefined; }
+  try { return { value: JSON.parse(text), truncated: false }; } catch { /* fall through */ }
+  const partial = parsePartialJson(t);
+  return partial === undefined ? undefined : { value: partial, truncated: true };
+}
+
+// Recursive-descent JSON parser that tolerates end-of-input at any point: an
+// unfinished string is kept as far as it was read, an unfinished object/array
+// drops only its incomplete trailing element, and an unfinished value is
+// discarded. Used only as a fallback for truncated bodies.
+function parsePartialJson(src: string): unknown | undefined {
+  let i = 0;
+  const n = src.length;
+  const EOF = Symbol('eof');
+
+  function skipWs(): void {
+    while (i < n) {
+      const c = src.charCodeAt(i);
+      if (c === 32 || c === 9 || c === 10 || c === 13) i++;
+      else break;
+    }
+  }
+
+  function parseString(): string {
+    i++; // opening quote
+    let out = '';
+    while (i < n) {
+      const ch = src[i++];
+      if (ch === '\\') {
+        if (i >= n) break; // truncated escape
+        const e = src[i++];
+        switch (e) {
+          case '"': out += '"'; break;
+          case '\\': out += '\\'; break;
+          case '/': out += '/'; break;
+          case 'b': out += '\b'; break;
+          case 'f': out += '\f'; break;
+          case 'n': out += '\n'; break;
+          case 'r': out += '\r'; break;
+          case 't': out += '\t'; break;
+          case 'u': {
+            if (i + 4 <= n) {
+              const code = parseInt(src.slice(i, i + 4), 16);
+              if (!Number.isNaN(code)) { out += String.fromCharCode(code); i += 4; }
+            } else { i = n; }
+            break;
+          }
+          default: out += e;
+        }
+      } else if (ch === '"') {
+        return out;
+      } else {
+        out += ch;
+      }
+    }
+    return out; // truncated mid-string
+  }
+
+  function parseNumber(): number | typeof EOF {
+    const start = i;
+    if (src[i] === '-') i++;
+    while (i < n && '0123456789.eE+-'.includes(src[i])) i++;
+    // A number that runs right up to end-of-input has no delimiter after it, so
+    // it was cut mid-token (e.g. "12345" truncated to "123") — drop it rather
+    // than surface a wrong value.
+    if (i >= n) return EOF;
+    const num = Number(src.slice(start, i));
+    return Number.isNaN(num) ? EOF : num;
+  }
+
+  function parseKeyword(word: string, value: unknown): unknown | typeof EOF {
+    if (!src.startsWith(word, i)) return EOF;
+    i += word.length;
+    return value;
+  }
+
+  function parseValue(): unknown | typeof EOF {
+    skipWs();
+    if (i >= n) return EOF;
+    const ch = src[i];
+    if (ch === '{') return parseObject();
+    if (ch === '[') return parseArray();
+    if (ch === '"') return parseString();
+    if (ch === '-' || (ch >= '0' && ch <= '9')) return parseNumber();
+    if (ch === 't') return parseKeyword('true', true);
+    if (ch === 'f') return parseKeyword('false', false);
+    if (ch === 'n') return parseKeyword('null', null);
+    return EOF; // unexpected/truncated token
+  }
+
+  function parseObject(): Record<string, unknown> {
+    i++; // '{'
+    const obj: Record<string, unknown> = {};
+    while (true) {
+      skipWs();
+      if (i >= n) return obj;
+      if (src[i] === '}') { i++; return obj; }
+      if (src[i] === ',') { i++; continue; }
+      if (src[i] !== '"') return obj; // truncated/malformed key
+      const key = parseString();
+      skipWs();
+      if (i >= n || src[i] !== ':') return obj; // no colon → drop incomplete pair
+      i++; // ':'
+      const val = parseValue();
+      if (val === EOF) return obj; // truncated value → drop incomplete pair
+      obj[key] = val;
+    }
+  }
+
+  function parseArray(): unknown[] {
+    i++; // '['
+    const arr: unknown[] = [];
+    while (true) {
+      skipWs();
+      if (i >= n) return arr;
+      if (src[i] === ']') { i++; return arr; }
+      if (src[i] === ',') { i++; continue; }
+      const val = parseValue();
+      if (val === EOF) return arr; // truncated element
+      arr.push(val);
+    }
+  }
+
+  const root = parseValue();
+  if (root === EOF) return undefined;
+  // A clean truncation consumes everything up to the cut point. Leftover
+  // non-whitespace means the parser stopped on mid-body garbage (malformed,
+  // not truncated) — reject so the caller shows the raw body instead of a
+  // misleadingly "recovered" empty/partial tree.
+  skipWs();
+  if (i < n) return undefined;
+  return root;
 }
 
 function isError(r: ApiRequest): boolean {
@@ -590,6 +758,7 @@ function statusBucket(req: ApiRequest): string {
 function collectJsonLeaves(root: unknown, out: Array<{value: string; kind: string}>): void {
   const seen = new Set<string>();
   function walk(value: unknown): void {
+    if (out.length >= MAX_JSON_LEAVES) return; // bound work on very large bodies
     if (value === null || typeof value === 'boolean') return;
     const t = typeof value;
     if (t === 'string') {
@@ -626,7 +795,9 @@ function flattenJsonRows(value: unknown): JsonRow[] {
   const keySeg = (k: string | null): JsonSeg[] =>
     k === null ? [] : [textSeg(`<span class="ov-jk">"${escHtml(k)}"</span>: `)];
 
+  let capped = false;
   function walk(v: unknown, depth: number, key: string | null, trailing: boolean): void {
+    if (rows.length >= MAX_JSON_ROWS) { capped = true; return; }
     if (v === null) {
       rows.push({ depth, segs: [...keySeg(key), leafSeg('null', 'null', 'null'), ...commaSeg(trailing)] });
       return;
@@ -672,6 +843,9 @@ function flattenJsonRows(value: unknown): JsonRow[] {
     } catch { /* skip */ }
   }
   walk(value, 0, null, false);
+  if (capped) {
+    rows.push({ depth: 0, segs: [textSeg(`<span class="ov-jk">… ${MAX_JSON_ROWS.toLocaleString()}+ lines — display capped</span>`)] });
+  }
   return rows;
 }
 
@@ -1086,9 +1260,12 @@ function detailPanelHtml(req: ApiRequest): string {
   if (activeTab === 'response') {
     let resBodyHtml: string;
     if (req.resBody != null) {
-      const parsed = tryParseJsonContainer(req.resBody);
+      const parsed = parseJsonBody(req.resBody);
+      const truncNote = parsed?.truncated
+        ? '<div class="ov-trunc-note">⚠ response truncated — showing recovered partial body</div>'
+        : '';
       resBodyHtml = parsed !== undefined
-        ? `<div class="ov-body-json" data-id="${req.id}"></div>`
+        ? `${truncNote}<div class="ov-body-json" data-id="${req.id}"></div>`
         : `<pre class="ov-body-pre">${escHtml(formatBody(req.resBody).slice(0, 3000))}</pre>`;
     } else if (req.status === 'pending') {
       resBodyHtml = '<div class="ov-body-none">Waiting…</div>';
@@ -1488,6 +1665,10 @@ function bindListDelegation(list: HTMLElement): void {
 
     const row = target.closest<HTMLElement>('.ov-row');
     if (!row) return;
+    // The detail panel is rendered inside .ov-row, so a click on its body (not on
+    // a tab/copy/value control handled above) would otherwise bubble here and
+    // collapse the row. Only the summary header toggles expansion.
+    if (target.closest('.ov-detail')) return;
     const id = Number(row.dataset.id);
     if (expandedIds.has(id)) {
       expandedIds.delete(id);
@@ -2687,6 +2868,12 @@ function injectStyles(): void {
     }
     .ov-body-pre::-webkit-scrollbar { width: 8px !important; }
     .ov-body-pre::-webkit-scrollbar-thumb { background: var(--ov-scrollbar) !important; }
+    .ov-trunc-note {
+      font-size: calc(9px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-s-4xx) !important;
+      margin-bottom: 4px !important;
+      letter-spacing: .02em !important;
+    }
     .ov-body-json {
       display: block !important;
       background: var(--ov-bg) !important;
