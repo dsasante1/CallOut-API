@@ -528,6 +528,25 @@ function loadFont(): Promise<{ family: FontFamilyKey; size: FontSizeKey }> {
 
 // ── String / URL helpers ──────────────────────────────────────────────────────
 
+// JSON string values can carry literal control characters (e.g. newlines in a
+// commit message body). The JSON virtualizer gives every row a fixed-height,
+// white-space:pre line, so an unescaped "\n" splits one row across several
+// physical lines that overflow and overlap the rows below. Escape control chars
+// the way JSON.stringify renders them so each value stays on a single line.
+function escJsonControl(s: string): string {
+  return s.replace(/[\\\x00-\x1f]/g, (c) => {
+    switch (c) {
+      case '\\': return '\\\\';
+      case '\n': return '\\n';
+      case '\r': return '\\r';
+      case '\t': return '\\t';
+      case '\b': return '\\b';
+      case '\f': return '\\f';
+      default: return `\\u${c.charCodeAt(0).toString(16).padStart(4, '0')}`;
+    }
+  });
+}
+
 function escHtml(str: unknown): string {
   return String(str)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
@@ -807,7 +826,7 @@ function flattenJsonRows(value: unknown): JsonRow[] {
       const s = v as string;
       const cut = s.length > MAX_JSON_LEAF_LEN ? s.slice(0, MAX_JSON_LEAF_LEN) : s;
       const ell = cut.length < s.length ? '…' : '';
-      rows.push({ depth, segs: [...keySeg(key), leafSeg('string', `"${escHtml(cut)}${ell}"`, cut), ...commaSeg(trailing)] });
+      rows.push({ depth, segs: [...keySeg(key), leafSeg('string', `"${escHtml(escJsonControl(cut))}${ell}"`, cut), ...commaSeg(trailing)] });
       return;
     }
     if (t === 'number' || t === 'boolean') {
@@ -1012,7 +1031,10 @@ function findValuesInDom(value: string, kind: string): HTMLElement[] {
   const trimmed = value.trim();
   if (!trimmed) return [];
   if (kind === 'boolean' || kind === 'null') return [];
-  if (trimmed.length < MIN_VALUE_LEN) return [];
+  // Numbers match by normalized numeric value, not substring, so single-digit
+  // counts (e.g. "5 Branches") are unambiguous and exempt from the length floor
+  // that suppresses noisy short-string matches.
+  if (kind !== 'number' && trimmed.length < MIN_VALUE_LEN) return [];
   const results: HTMLElement[] = [];
   const seen = new Set<HTMLElement>();
   const collect = (el: HTMLElement | null): boolean => {
