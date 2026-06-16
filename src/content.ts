@@ -2040,6 +2040,21 @@ function clusterBadgeRowHtml(req: ApiRequest): string {
   return `<div class="ov-fb-row" data-id="${req.id}"><span class="ov-fb-m ov-fb-m-${safeMethodClass(req.method)}">${escHtml(req.method)}</span><span class="ov-fb-url">${escHtml(path)}</span>${statusHtml}</div>`;
 }
 
+// The single inline badge grows rightward from its anchor and can spill off the
+// right edge of the viewport when anchored to an element near that edge. After
+// its content is rendered, shift it left of the anchor so the whole box stays
+// visible (max-width on .ov-fb-single ensures very long paths ellipsis-truncate
+// first). Always derived from the stored anchor — never the current left — so it
+// is idempotent across re-renders and lets the badge drift back right when its
+// width shrinks. Horizontal only; the vertical anchor is clamped in flashBadge.
+function clampBadgeLeftIntoView(badge: HTMLElement): void {
+  const anchor = parseFloat(badge.dataset.anchorLeft ?? badge.style.left) || 0;
+  const w = badge.offsetWidth; // forces layout; accurate once content + CSS applied
+  const maxLeft = window.scrollX + window.innerWidth - w - 8;
+  const minLeft = window.scrollX + 4;
+  badge.style.left = `${Math.max(minLeft, Math.min(anchor, maxLeft))}px`;
+}
+
 function refreshClusterBadge(sel: string): void {
   const badge = selectorBadges.get(sel);
   if (!badge) return;
@@ -2054,6 +2069,7 @@ function refreshClusterBadge(sel: string): void {
     badge.dataset.theme = currentTheme;
     badge.classList.remove('ov-fb-open');
     badge.innerHTML = clusterBadgeRowHtml(r);
+    clampBadgeLeftIntoView(badge);
     return;
   }
 
@@ -2061,6 +2077,9 @@ function refreshClusterBadge(sel: string): void {
   if (!badge.classList.contains('ov-fb-cluster')) {
     badge.className = 'ov-float-badge ov-fb-cluster';
     badge.dataset.theme = currentTheme;
+    // The single badge may have shifted left to fit; the small cluster circle
+    // fits at the original anchor, so snap it back to the element's corner.
+    if (badge.dataset.anchorLeft) badge.style.left = `${badge.dataset.anchorLeft}px`;
   }
 
   const open = badge.classList.contains('ov-fb-open');
@@ -2249,6 +2268,10 @@ function flashBadge(req: ApiRequest): void {
         window.innerWidth - 30
       );
       const cy = Math.max(window.scrollY + rect.top - 13, window.scrollY + 4);
+      // Remember the intended top-right anchor; the single badge may shift left
+      // of it to stay on-screen (see clampBadgeLeftIntoView), and the cluster circle
+      // must be able to snap back to it.
+      badge.dataset.anchorLeft = String(cx);
       badge.style.cssText = `top:${cy}px;left:${cx}px;`;
       document.documentElement.appendChild(badge);
       selectorBadges.set(sel, badge);
@@ -3211,6 +3234,7 @@ function injectStyles(): void {
       border-radius: 4px !important;
       box-shadow: 0 2px 8px rgba(0,0,0,.45) !important;
       animation: ov-fadein .15s ease !important;
+      max-width: min(340px, 90vw) !important;
     }
     .ov-fb-single .ov-fb-row { border-bottom: none !important; }
     .ov-fb-single .ov-fb-url { color: #9aa1ab !important; }
