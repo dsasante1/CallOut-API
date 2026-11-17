@@ -21,6 +21,8 @@ const EXPORTED = [
   'pinnedIds', 'trimRequests', 'renderFooter', 'escHtml',
   'flattenJsonRows', 'jsonRowToHtml', 'escJsonControl', 'pinKey',
   'selectorBadges', 'selectorReqIds', 'clusterBadgeRowHtml', 'refreshPill',
+  'startMutationLog', 'renderFootprints', 'runBulkHighlight',
+  'handleJsonValueClick', 'bindListDelegation', 'revealBarHtml', 'syncRevealBar', 'commitPanelDodge',
 ] as const
 
 export type OverlayApi = Record<(typeof EXPORTED)[number], any>
@@ -120,8 +122,7 @@ let addEventListenerPatched = false
 function patchAddEventListener(): void {
   if (addEventListenerPatched) return
   addEventListenerPatched = true
-  const original = EventTarget.prototype.addEventListener
-  EventTarget.prototype.addEventListener = function (
+  const wrap = (original: EventTarget['addEventListener']) => function (
     this: EventTarget,
     type: string,
     fn: EventListenerOrEventListenerObject | null,
@@ -129,6 +130,12 @@ function patchAddEventListener(): void {
   ) {
     tracked.push({ target: this, type, fn, opts })
     return original.call(this, type, fn, opts)
+  }
+  EventTarget.prototype.addEventListener = wrap(EventTarget.prototype.addEventListener)
+  // In vitest's jsdom environment window.addEventListener is an own property,
+  // not the prototype method, so window listeners need wrapping separately.
+  if (Object.prototype.hasOwnProperty.call(window, 'addEventListener')) {
+    window.addEventListener = wrap(window.addEventListener) as typeof window.addEventListener
   }
 }
 

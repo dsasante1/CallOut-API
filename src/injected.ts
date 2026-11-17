@@ -238,6 +238,72 @@ interface XMLHttpRequest {
     return result;
   }
 
+  // ── Body reads ──
+  // When the page itself takes a response's data: res.json()/text()/… resolving,
+  // res.body being taken, or an XHR's response being read once it is DONE. The
+  // content script starts the request's render window here — a page renders right
+  // after it reads the data, not when the network finished — and a request the
+  // page never reads gets none. The hook's own capture reads a clone (fetch) or
+  // the original getter (XHR), so it is never mistaken for the page.
+  const responseIds = new WeakMap<object, number>();
+  const readReported = new WeakSet<object>();
+
+  function trackReads(owner: object, id: number): void {
+    responseIds.set(owner, id);
+    readReported.delete(owner);   // an XHR object can be reused for another send
+  }
+
+  function reportRead(owner: object): void {
+    const id = responseIds.get(owner);
+    if (id === undefined || readReported.has(owner)) return;
+    readReported.add(owner);
+    emit({ id, readTs: Date.now() });
+  }
+
+  // Report from inside the promise chain, before the page's own continuation runs.
+  type BodyMethod = (this: Response, ...a: unknown[]) => Promise<unknown>;
+  const responseProto = Response.prototype as unknown as Record<string, BodyMethod>;
+  for (const name of ['json', 'text', 'arrayBuffer', 'blob', 'formData', 'bytes']) {
+    const original = responseProto[name];
+    if (typeof original !== 'function') continue;
+    responseProto[name] = function (this: Response, ...a: unknown[]): Promise<unknown> {
+      const p = original.apply(this, a);
+      if (!responseIds.has(this)) return p;
+      return p.then(v => { reportRead(this); return v; });
+    };
+  }
+
+  const bodyDesc = Object.getOwnPropertyDescriptor(Response.prototype, 'body');
+  if (bodyDesc?.get) {
+    const getBody = bodyDesc.get;
+    Object.defineProperty(Response.prototype, 'body', {
+      ...bodyDesc,
+      get(this: Response) { const b = getBody.call(this); reportRead(this); return b; },
+    });
+  }
+
+  const xhrGetters: Record<string, (this: XMLHttpRequest) => unknown> = {};
+  for (const prop of ['responseText', 'response', 'responseXML']) {
+    const desc = Object.getOwnPropertyDescriptor(XMLHttpRequest.prototype, prop);
+    if (!desc?.get) continue;
+    const get = desc.get as (this: XMLHttpRequest) => unknown;
+    xhrGetters[prop] = get;
+    Object.defineProperty(XMLHttpRequest.prototype, prop, {
+      ...desc,
+      get(this: XMLHttpRequest) {
+        const v = get.call(this);
+        if (this.readyState === 4) reportRead(this);
+        return v;
+      },
+    });
+  }
+
+  // The hook's own XHR body capture, bypassing the read-reporting getter.
+  function ownResponseText(xhr: XMLHttpRequest): string {
+    const get = xhrGetters.responseText;
+    return String((get ? get.call(xhr) : xhr.responseText) ?? '');
+  }
+
   const _fetch = window.fetch;
   window.fetch = function (...args: Parameters<typeof fetch>): ReturnType<typeof fetch> {
     if (stopped || !capturing) return _fetch.apply(this, args);
@@ -269,6 +335,7 @@ interface XMLHttpRequest {
         const ms = Date.now() - t0;
         const resHeaders = headersFromObject(res.headers);
         emit({ id, url, method, kind: 'fetch', status: res.status, ms, element: elementInfo(el), ts: t0, reqBody, reqHeaders, resHeaders });
+        trackReads(res, id);
         if (isTextLikeResponse(res)) {
           readBodyStreaming(res.clone(), MAX_BODY_BYTES).then(text => {
             emit({ id, resBody: text });
@@ -321,6 +388,7 @@ interface XMLHttpRequest {
     const t0 = Date.now();
 
     emit({ id, url, method, kind: 'xhr', status: 'pending', element: elementInfo(el), ts: t0, reqBody, reqHeaders });
+    trackReads(this, id);
 
     if (this.__ov_load_listener) this.removeEventListener('load', this.__ov_load_listener);
     if (this.__ov_error_listener) this.removeEventListener('error', this.__ov_error_listener);
@@ -333,7 +401,7 @@ interface XMLHttpRequest {
       if (!tooBig && (xhr.responseType === '' || xhr.responseType === 'text')) {
         const ct = xhr.getResponseHeader('content-type') ?? '';
         if (!ct || TEXTLIKE_CT.test(ct)) {
-          resBody = xhr.responseText?.slice(0, MAX_BODY_BYTES) ?? null;
+          resBody = ownResponseText(xhr).slice(0, MAX_BODY_BYTES);
         }
       }
       const resHeaders = parseRawHeaders(xhr.getAllResponseHeaders());

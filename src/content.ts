@@ -30,6 +30,9 @@ interface ApiRequest {
   _smFolded?: boolean;
   reqBody?: string | null;
   resBody?: string | null;
+  // When the page itself first read the response body (see injected.ts). Starts
+  // the request's render footprint window.
+  readTs?: number;
   reqHeaders?: HeaderPair[] | null;
   resHeaders?: HeaderPair[] | null;
   messages?: WsMessage[];
@@ -68,6 +71,27 @@ const MAX_JSON_LEAVES = 2_000;
 const MAX_PRESERVED_BODY_BYTES = 256_000;
 const MIN_VALUE_LEN = 2;
 const MIN_SUBSTRING_LEN = 4;
+// Strict matching (inside a render footprint, or for a response read during page
+// load): a string must be an element's whole text; only values this long — IDs,
+// URLs, sentences — may also match inside longer text, where a coincidence is rare.
+const STRICT_SUBSTRING_LEN = 12;
+// The page counts as settled once it has been quiet this long after `load`, or
+// this long after `load` at the latest (some pages never go quiet). A response
+// read before then gets no footprint: everything is rendering at once.
+const PAGE_SETTLE_QUIET_MS = 1000;
+const PAGE_SETTLE_MAX_MS = 5000;
+// Render footprint: the page DOM that changed once the page read a response's
+// data (the hook's `readTs`). The change log looks back MUTATION_LOG_MS so a
+// window can open after the fact — the page renders before our message arrives.
+// A window opens FOOTPRINT_SLACK_MS before the read, closes once the DOM has been
+// quiet for FOOTPRINT_QUIET_MS, and never stays open past FOOTPRINT_MAX_MS.
+const MUTATION_LOG_MS = 3000;
+const FOOTPRINT_SLACK_MS = 50;
+const FOOTPRINT_QUIET_MS = 300;
+const FOOTPRINT_MAX_MS = 2000;
+const FOOTPRINT_TICK_MS = 100;
+const MAX_FOOTPRINT_ROOTS = 200;
+const MAX_FOOTPRINT_PENDING = 5000;
 
 const requests = new Map<number, ApiRequest>();
 const expandedIds = new Set<number>();
@@ -166,9 +190,17 @@ let dismissClickHandler: ((e: MouseEvent) => void) | null = null;
 let pressStartedOnOverlay = false;
 
 let valueHighlightEls: HTMLElement[] = [];
-let valueHighlightIndex = 0;
 let valueHighlightKey = '';
+// What the ‹ › stepper walks: a single traced value's matches, or the visible
+// matches of a whole response ("reveal all"). Only one of the two is active.
+let traceEls: HTMLElement[] = [];
+let traceIndex = 0;
+let traceOwner: 'value' | 'bulk' | null = null;
+let traceCapped = false;
+let renderAreaEls: Element[] = [];   // footprint roots outlined while navigating
 let bulkHighlightEls: HTMLElement[] = [];
+let bulkScoped = false;
+let bulkSteppable = 0;   // matches laid out on the page, i.e. ones ‹ › can go to
 let bulkHighlightRowId = -1;
 let jvHoverEls: HTMLElement[] = [];
 let jvHoverKey = '';
@@ -344,6 +376,7 @@ function trimRequests(): void {
     if (k === undefined) break;
     const trimmed = requests.get(k);
     requests.delete(k);
+    forgetFootprint(k);
     expandedIds.delete(k);
     detailTabs.delete(k);
     pinnedIds.delete(k);
@@ -438,6 +471,7 @@ function handleOverlayMessage(msg: OverlayMessage): void {
   if (existing) {
     updateExistingRequest(existing, msg);
   } else {
+    if (msg.readTs !== undefined) return;   // read report for a trimmed/unknown request
     if (paused) return;
     const fresh = { ...msg, pageUrl: location.href } as ApiRequest;
     refreshSearchCache(fresh, msg);
@@ -455,6 +489,7 @@ function handleOverlayMessage(msg: OverlayMessage): void {
   // outlive trimRequests(), which drops the oldest entries out of `requests`.
   const folded = requests.get(msg.id);
   if (folded) smFoldRequest(folded);
+  if (folded) trackFootprint(folded, msg);
 
   scheduleRenderUnlessPaused();
 
@@ -513,6 +548,7 @@ chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, 
       clearBulkHighlights();
       clearJvHover();
       clearRevHighlight();
+      clearFootprints();
       clearPreserved();
       smReset();
       renderList();
@@ -1079,6 +1115,189 @@ function mountJsonVirtualizer(host: HTMLElement, rows: JsonRow[], reqId: number)
   };
 }
 
+// ── Render footprint ──────────────────────────────────────────────────────────
+// Which part of the page a response rendered into. Value matching alone can't
+// tell "this response put that text there" from "that text happens to be on the
+// page too"; scoping the search to what changed right after the response landed
+// can. Requests with no footprint (replayed, preserved, rendered from cache or
+// too late) fall back to a page-wide search and say so.
+
+interface MutationEntry { t: number; els: Element[] }
+interface FootprintWindow { anchor: number; lastActivity: number; els: Set<Element> }
+
+let mutationObserver: MutationObserver | null = null;
+const mutationLog: MutationEntry[] = [];
+const openFootprints = new Map<number, FootprintWindow>();
+const renderFootprints = new Map<number, Element[]>();
+const loadPhaseReads = new Set<number>();   // read before the page settled: no footprint
+let footprintTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Page settle: see PAGE_SETTLE_QUIET_MS. `load` is taken from the navigation
+// timing entry when this script starts after it (the usual case on activation).
+let pageLoadedAt: number | null = null;
+let pageSettledAt: number | null = null;
+let lastPageMutationAt = 0;
+
+function notePageLoad(): void {
+  if (pageLoadedAt !== null) return;
+  const nav = performance.getEntriesByType?.('navigation')[0] as PerformanceNavigationTiming | undefined;
+  pageLoadedAt = nav && nav.loadEventEnd > 0 ? performance.timeOrigin + nav.loadEventEnd : Date.now();
+}
+
+if (document.readyState === 'complete') notePageLoad();
+else window.addEventListener('load', notePageLoad, { once: true });
+
+// Whether the page had settled by time `t`. Checked at every page mutation (so
+// an earlier quiet spell is caught even if rendering resumed) and on demand.
+function pageSettledBy(t: number): boolean {
+  if (pageSettledAt === null && pageLoadedAt !== null) {
+    const quietFrom = Math.max(lastPageMutationAt, pageLoadedAt);
+    if (t - quietFrom >= PAGE_SETTLE_QUIET_MS) pageSettledAt = quietFrom + PAGE_SETTLE_QUIET_MS;
+    else if (t - pageLoadedAt >= PAGE_SETTLE_MAX_MS) pageSettledAt = pageLoadedAt + PAGE_SETTLE_MAX_MS;
+  }
+  return pageSettledAt !== null && t >= pageSettledAt;
+}
+
+function startMutationLog(): void {
+  if (mutationObserver || !document.body) return;
+  mutationObserver = new MutationObserver(onPageMutations);
+  mutationObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
+}
+
+function stopMutationLog(): void {
+  mutationObserver?.disconnect();
+  mutationObserver = null;
+  mutationLog.length = 0;
+  clearFootprints();
+}
+
+function clearFootprints(): void {
+  openFootprints.clear();
+  renderFootprints.clear();
+  loadPhaseReads.clear();
+  if (footprintTimer !== null) { clearTimeout(footprintTimer); footprintTimer = null; }
+}
+
+function forgetFootprint(id: number): void {
+  openFootprints.delete(id);
+  renderFootprints.delete(id);
+  loadPhaseReads.delete(id);
+}
+
+// Body/html changes say nothing about where data landed, and the overlay's own
+// DOM isn't the page's.
+function pushMutated(out: Element[], el: Element | null): void {
+  if (!el || el === document.body || el === document.documentElement) return;
+  if (isOverlayOwned(el)) return;
+  out.push(el);
+}
+
+function onPageMutations(records: MutationRecord[]): void {
+  const els: Element[] = [];
+  for (const r of records) {
+    if (r.type === 'characterData') { pushMutated(els, r.target.parentElement); continue; }
+    for (const n of r.addedNodes) {
+      pushMutated(els, n instanceof Element ? n : (r.target instanceof Element ? r.target : null));
+    }
+  }
+  if (els.length === 0) return;
+  const t = Date.now();
+  pageSettledBy(t);   // before recording this change, which ends any quiet spell
+  lastPageMutationAt = t;
+  mutationLog.push({ t, els });
+  while (mutationLog.length && t - mutationLog[0].t > MUTATION_LOG_MS) mutationLog.shift();
+  for (const w of openFootprints.values()) {
+    addFootprintEls(w, els);
+    w.lastActivity = t;
+  }
+}
+
+function addFootprintEls(w: FootprintWindow, els: Iterable<Element>): void {
+  for (const el of els) {
+    if (w.els.size >= MAX_FOOTPRINT_PENDING) return;
+    w.els.add(el);
+  }
+}
+
+// The window opens when the page reads the response (the hook's `{ id, readTs }`
+// message), not when the network finished: what renders between completion and
+// the read — another request's output, a timer — isn't this response's. A
+// request the page never reads (telemetry, prefetch) gets no footprint, so it
+// falls back to a page-wide search, as does one read while the page was still
+// loading (see pageSettledBy).
+function trackFootprint(req: ApiRequest, msg: OverlayMessage): void {
+  if (!mutationObserver || req.kind === 'ws' || typeof msg.readTs !== 'number') return;
+  if (!pageSettledBy(msg.readTs)) {
+    loadPhaseReads.add(req.id);
+    renderFootprints.delete(req.id);
+    return;
+  }
+  loadPhaseReads.delete(req.id);
+  const now = Date.now();
+  const w: FootprintWindow = { anchor: now, lastActivity: now, els: new Set() };
+  const from = msg.readTs - FOOTPRINT_SLACK_MS;
+  for (const e of mutationLog) if (e.t >= from) addFootprintEls(w, e.els);
+  renderFootprints.delete(req.id);
+  openFootprints.set(req.id, w);
+  scheduleFootprintTick();
+}
+
+function scheduleFootprintTick(): void {
+  if (footprintTimer !== null) return;
+  footprintTimer = setTimeout(footprintTick, FOOTPRINT_TICK_MS);
+}
+
+function footprintTick(): void {
+  footprintTimer = null;
+  const now = Date.now();
+  for (const [id, w] of openFootprints) {
+    const quiet = now - w.lastActivity >= FOOTPRINT_QUIET_MS;
+    if (!quiet && now - w.anchor < FOOTPRINT_MAX_MS) continue;
+    openFootprints.delete(id);
+    const roots = footprintRoots(w.els);
+    if (roots.length) renderFootprints.set(id, roots);
+    else renderFootprints.delete(id);
+  }
+  if (openFootprints.size) scheduleFootprintTick();
+}
+
+// Reduce changed elements to the top-most connected ones. When a render touched
+// too many separate places (e.g. 500 rows appended one by one), climb to their
+// parents until the set is small — a coarser footprint beats none.
+function footprintRoots(els: Iterable<Element>): Element[] {
+  let roots = topMostElements(els);
+  while (roots.length > MAX_FOOTPRINT_ROOTS) {
+    const parents: Element[] = [];
+    for (const el of roots) {
+      const p = el.parentElement;
+      parents.push(p && p !== document.body && p !== document.documentElement ? p : el);
+    }
+    const next = topMostElements(parents);
+    if (next.length === roots.length) break;   // already at body's children
+    roots = next;
+  }
+  return roots;
+}
+
+function topMostElements(els: Iterable<Element>): Element[] {
+  const set = new Set<Element>();
+  for (const el of els) if (el.isConnected) set.add(el);
+  const out: Element[] = [];
+  for (const el of set) {
+    let p = el.parentElement;
+    while (p && !set.has(p)) p = p.parentElement;
+    if (!p) out.push(el);
+  }
+  return out;
+}
+
+// The request's footprint as it stands now; null when there's nothing to scope to
+// (never recorded, or every recorded element has since been replaced).
+function liveFootprint(id: number): Element[] | null {
+  const roots = renderFootprints.get(id)?.filter(el => el.isConnected);
+  return roots && roots.length ? roots : null;
+}
+
 // ── DOM value search / highlight ──────────────────────────────────────────────
 
 function normalizeNumber(s: string): string {
@@ -1088,28 +1307,34 @@ function normalizeNumber(s: string): string {
   return Number.isFinite(n) ? String(n) : '';
 }
 
-interface SearchTerm { lower: string; value: string; kind: string; numNorm: string }
+interface SearchTerm { lower: string; value: string; kind: string; numNorm: string; strict: boolean }
 
-function makeSearchTerm(value: string, kind: string): SearchTerm {
+function makeSearchTerm(value: string, kind: string, strict = false): SearchTerm {
   return {
-    lower: value.toLowerCase(), value, kind,
+    lower: value.toLowerCase(), value, kind, strict,
     numNorm: kind === 'number' ? normalizeNumber(value) : '',
   };
 }
 
+// Shortest value that may match inside longer text rather than as the whole of it.
+function substringFloor(term: SearchTerm): number {
+  return term.strict ? STRICT_SUBSTRING_LEN : MIN_SUBSTRING_LEN;
+}
+
 // Numbers match on normalized numeric value; strings match whole-text (either
-// case) or, once long enough to be unambiguous, as a substring.
+// case) or, once long enough to be unambiguous, as a substring — a higher bar
+// for strict terms, so a username doesn't light up every link containing it.
 function textMatchesTerm(text: string, textLower: string, term: SearchTerm): boolean {
   if (term.kind === 'number') {
     return term.numNorm !== '' && normalizeNumber(text) === term.numNorm;
   }
   return text === term.value || textLower === term.lower
-    || (term.value.length >= MIN_SUBSTRING_LEN && textLower.includes(term.lower));
+    || (term.value.length >= substringFloor(term) && textLower.includes(term.lower));
 }
 
 // Text nodes worth searching: skips the overlay's own DOM and non-rendered tags.
-function createPageTextWalker(): TreeWalker {
-  return document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+function createPageTextWalker(root: Node = document.body): TreeWalker {
+  return document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
     acceptNode(node) {
       const parent = node.parentElement;
       if (!parent || isOverlayOwned(parent)) return NodeFilter.FILTER_REJECT;
@@ -1120,7 +1345,19 @@ function createPageTextWalker(): TreeWalker {
   });
 }
 
-function findMultipleValuesInDom(queries: Array<{value: string; kind: string}>): HTMLElement[] {
+// Search roots: the whole page, or a request's render footprint. Footprint roots
+// are disjoint (topMostElements), so walking each one never visits a node twice.
+function searchRoots(roots?: Element[] | null): Node[] {
+  return roots ?? [document.body];
+}
+
+function withinRoots(el: Element, roots?: Element[] | null): boolean {
+  return !roots || roots.some(r => r.contains(el));
+}
+
+function findMultipleValuesInDom(
+  queries: Array<{value: string; kind: string}>, roots?: Element[] | null, strict = !!roots,
+): HTMLElement[] {
   if (queries.length === 0) return [];
   const termSeen = new Set<string>();
   const terms: SearchTerm[] = [];
@@ -1128,20 +1365,22 @@ function findMultipleValuesInDom(queries: Array<{value: string; kind: string}>):
     const key = `${q.kind}:${q.value}`;
     if (termSeen.has(key)) continue;
     termSeen.add(key);
-    terms.push(makeSearchTerm(q.value, q.kind));
+    terms.push(makeSearchTerm(q.value, q.kind, strict));
   }
   if (terms.length === 0) return [];
 
   const results: HTMLElement[] = [];
   const seenEls = new Set<HTMLElement>();
-  const walker = createPageTextWalker();
-  for (let node = walker.nextNode(); node && results.length < MAX_VALUE_HIGHLIGHTS; node = walker.nextNode()) {
-    const text = (node.nodeValue ?? '').trim();
-    if (!text) continue;
-    const textLower = text.toLowerCase();
-    if (!terms.some(term => textMatchesTerm(text, textLower, term))) continue;
-    const parent = (node as Text).parentElement;
-    if (parent && !seenEls.has(parent)) { seenEls.add(parent); results.push(parent); }
+  for (const root of searchRoots(roots)) {
+    const walker = createPageTextWalker(root);
+    for (let node = walker.nextNode(); node && results.length < MAX_VALUE_HIGHLIGHTS; node = walker.nextNode()) {
+      const text = (node.nodeValue ?? '').trim();
+      if (!text) continue;
+      const textLower = text.toLowerCase();
+      if (!terms.some(term => textMatchesTerm(text, textLower, term))) continue;
+      const parent = (node as Text).parentElement;
+      if (parent && !seenEls.has(parent)) { seenEls.add(parent); results.push(parent); }
+    }
   }
   return results;
 }
@@ -1150,30 +1389,34 @@ function findMultipleValuesInDom(queries: Array<{value: string; kind: string}>):
 // reached, so a scan can stop early exactly as the original inline loops did.
 type CollectFn = (el: HTMLElement | null) => boolean;
 
-function scanTextNodes(term: SearchTerm, collect: CollectFn): void {
-  const walker = createPageTextWalker();
-  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-    const text = (node.nodeValue ?? '').trim();
-    if (!text) continue;
-    if (!textMatchesTerm(text, text.toLowerCase(), term)) continue;
-    if (!collect((node as Text).parentElement)) break;
+function scanTextNodes(term: SearchTerm, collect: CollectFn, roots?: Element[] | null): void {
+  for (const root of searchRoots(roots)) {
+    const walker = createPageTextWalker(root);
+    for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+      const text = (node.nodeValue ?? '').trim();
+      if (!text) continue;
+      if (!textMatchesTerm(text, text.toLowerCase(), term)) continue;
+      if (!collect((node as Text).parentElement)) return;
+    }
   }
 }
 
-function scanInputValues(term: SearchTerm, collect: CollectFn): void {
+function scanInputValues(term: SearchTerm, collect: CollectFn, roots?: Element[] | null): void {
   const inputs = document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement>('input, textarea');
   for (const el of inputs) {
+    if (!withinRoots(el, roots)) continue;
     const v = (el.value ?? '').trim();
     if (!v) continue;
     const matches = v === term.value
-      || (term.value.length >= MIN_SUBSTRING_LEN && v.toLowerCase().includes(term.lower));
+      || (term.value.length >= substringFloor(term) && v.toLowerCase().includes(term.lower));
     if (matches && !collect(el)) break;
   }
 }
 
-function scanUrlAttributes(term: SearchTerm, collect: CollectFn): void {
+function scanUrlAttributes(term: SearchTerm, collect: CollectFn, roots?: Element[] | null): void {
   const urlEls = document.querySelectorAll<HTMLElement>('img[src], a[href], source[src], video[src], audio[src], iframe[src]');
   for (const el of urlEls) {
+    if (!withinRoots(el, roots)) continue;
     const src = el.getAttribute('src') ?? el.getAttribute('href') ?? '';
     if (!src) continue;
     const matches = src === term.value || src.endsWith(term.value)
@@ -1187,7 +1430,8 @@ function isUrlLikeValue(value: string, kind: string): boolean {
     && (/^https?:\/\//i.test(value) || value.startsWith('/') || value.startsWith('data:'));
 }
 
-function findValuesInDom(value: string, kind: string): HTMLElement[] {
+// `strict` defaults to on whenever the search is limited to a footprint.
+function findValuesInDom(value: string, kind: string, roots?: Element[] | null, strict = !!roots): HTMLElement[] {
   const trimmed = value.trim();
   if (!trimmed) return [];
   if (kind === 'boolean' || kind === 'null') return [];
@@ -1204,33 +1448,126 @@ function findValuesInDom(value: string, kind: string): HTMLElement[] {
     results.push(el);
     return results.length < MAX_VALUE_HIGHLIGHTS;
   };
-  const term = makeSearchTerm(trimmed, kind);
+  const term = makeSearchTerm(trimmed, kind, strict);
 
-  scanTextNodes(term, collect);
-  if (kind === 'string' && results.length < MAX_VALUE_HIGHLIGHTS) scanInputValues(term, collect);
+  scanTextNodes(term, collect, roots);
+  if (kind === 'string' && results.length < MAX_VALUE_HIGHLIGHTS) scanInputValues(term, collect, roots);
   if (isUrlLikeValue(trimmed, kind) && results.length < MAX_VALUE_HIGHLIGHTS) {
-    scanUrlAttributes(term, collect);
+    scanUrlAttributes(term, collect, roots);
   }
   return results;
 }
 
 function focusValueHighlight(): void {
-  for (const el of valueHighlightEls) el.classList.remove('ov-value-current');
-  const el = valueHighlightEls[valueHighlightIndex];
+  for (const el of traceEls) el.classList.remove('ov-value-current');
+  const el = traceEls[traceIndex];
   if (!el) return;
   el.classList.add('ov-value-current');
-  const rect = el.getBoundingClientRect();
-  const margin = 60;
-  const visible = rect.top >= margin && rect.bottom <= window.innerHeight - margin;
-  if (!visible) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  const scrolled = !isComfortablyVisible(el);
+  if (scrolled) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  avoidPanel(el, scrolled);
   positionValueCycler();
+}
+
+const TRACE_VIEW_MARGIN = 60;
+
+// On screen with some breathing room. The floating panel isn't considered here:
+// scrolling can't clear it, so avoidPanel moves the panel instead.
+function isComfortablyVisible(el: HTMLElement): boolean {
+  const rect = el.getBoundingClientRect();
+  return rect.top >= TRACE_VIEW_MARGIN && rect.bottom <= window.innerHeight - TRACE_VIEW_MARGIN;
+}
+
+type Box = Pick<DOMRect, 'left' | 'top' | 'right' | 'bottom' | 'width' | 'height'>;
+
+function panelRect(): Box | null {
+  const panel = $('ov-panel');
+  if (!panel || dockState !== 'panel' || !panelVisible) return null;
+  return panel.getBoundingClientRect();
+}
+
+function shiftBox(b: Box, dx: number, dy: number): Box {
+  return { left: b.left + dx, right: b.right + dx, top: b.top + dy, bottom: b.bottom + dy, width: b.width, height: b.height };
+}
+
+// Share of `a` hidden under `b`, 0–1.
+function coveredFraction(a: Box, b: Box): number {
+  const w = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+  const h = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+  if (w <= 0 || h <= 0) return 0;
+  return (w * h) / Math.max(1, a.width * a.height);
+}
+
+// ── Panel dodge ──
+// While stepping through matches, the panel steps aside when it would hide the
+// current one: it slides to whichever viewport edge clears the match with the
+// shortest move, and slides home once a match no longer needs it moved. Only
+// when no edge clears the match does it fade instead. The move is a transform,
+// so the saved panel position (ovPanelGeom) is never touched.
+const PANEL_DODGE_MARGIN = 16;
+const PANEL_COVER_THRESHOLD = 0.5;   // ignore matches less than half hidden
+let panelDodge = { x: 0, y: 0 };
+
+function avoidPanel(el: HTMLElement, scrolled: boolean): void {
+  const panel = $('ov-panel');
+  const current = panelRect();
+  if (!panel || !current) return;
+  const home = shiftBox(current, -panelDodge.x, -panelDodge.y);
+  const rect = el.getBoundingClientRect();
+  // Mid smooth-scroll the match isn't where it will land; scrollIntoView centres it.
+  const top = (window.innerHeight - rect.height) / 2;
+  const landed: Box = scrolled ? shiftBox(rect, 0, top - rect.top) : rect;
+  if (coveredFraction(landed, home) <= PANEL_COVER_THRESHOLD) { setPanelDodge(panel, 0, 0, false); return; }
+
+  const m = PANEL_DODGE_MARGIN;
+  const moves: Array<[number, number]> = [
+    [m - home.left, 0], [window.innerWidth - m - home.right, 0],
+    [0, m - home.top], [0, window.innerHeight - m - home.bottom],
+  ];
+  let best: { dx: number; dy: number; cover: number; cost: number } | null = null;
+  for (const [dx, dy] of moves) {
+    const cover = coveredFraction(landed, shiftBox(home, dx, dy));
+    if (cover > PANEL_COVER_THRESHOLD) continue;
+    const cost = Math.abs(dx) + Math.abs(dy);
+    if (!best || cover < best.cover || (cover === best.cover && cost < best.cost)) best = { dx, dy, cover, cost };
+  }
+  if (best) setPanelDodge(panel, best.dx, best.dy, false);
+  else setPanelDodge(panel, 0, 0, true);
+}
+
+function setPanelDodge(panel: HTMLElement, x: number, y: number, fade: boolean): void {
+  panelDodge = { x, y };
+  panel.classList.add('ov-dodge-anim');
+  if (x || y) panel.style.setProperty('transform', `translate(${x}px, ${y}px)`, 'important');
+  else panel.style.removeProperty('transform');
+  panel.classList.toggle('ov-trace-fade', fade);
+}
+
+function resetPanelDodge(): void {
+  const panel = $('ov-panel');
+  if (panel) setPanelDodge(panel, 0, 0, false);
+}
+
+// The user grabbed the panel while it was stepped aside: make where it is now
+// its real position, so the drag or resize starts from what they see.
+function commitPanelDodge(panel: HTMLElement): void {
+  panel.classList.remove('ov-trace-fade');
+  if (!panelDodge.x && !panelDodge.y) return;
+  const rect = panel.getBoundingClientRect();
+  panel.classList.remove('ov-dodge-anim');   // no slide: position and transform swap in one frame
+  panel.style.removeProperty('transform');
+  panel.style.setProperty('left', `${rect.left}px`, 'important');
+  panel.style.setProperty('top', `${rect.top}px`, 'important');
+  panel.style.setProperty('right', 'auto', 'important');
+  panel.style.setProperty('bottom', 'auto', 'important');
+  panelDodge = { x: 0, y: 0 };
 }
 
 // Park the cycler above the current match, flipping below it when the match sits
 // too close to the top of the viewport.
 function positionValueCycler(): void {
   const cycler = document.getElementById('ov-value-cycler');
-  const el = valueHighlightEls[valueHighlightIndex];
+  const el = traceEls[traceIndex];
   if (!cycler || !el) return;
   const rect = el.getBoundingClientRect();
   const below = rect.top < 48;
@@ -1239,22 +1576,49 @@ function positionValueCycler(): void {
   cycler.style.left = `${Math.max(window.scrollX + 4, window.scrollX + rect.left)}px`;
 }
 
+function clearTrace(): void {
+  for (const el of traceEls) el.classList.remove('ov-value-current');
+  const wasBulk = traceOwner === 'bulk';
+  traceEls = [];
+  traceIndex = 0;
+  traceOwner = null;
+  traceCapped = false;
+  document.getElementById('ov-value-cycler')?.remove();
+  resetPanelDodge();
+  clearRenderArea();
+  if (wasBulk) syncRevealBar();
+}
+
 function clearValueHighlights(): void {
-  for (const el of valueHighlightEls) {
-    el.classList.remove('ov-value-match');
-    el.classList.remove('ov-value-current');
-  }
+  for (const el of valueHighlightEls) el.classList.remove('ov-value-match');
   valueHighlightEls = [];
-  valueHighlightIndex = 0;
   valueHighlightKey = '';
   for (const el of document.querySelectorAll('.ov-jv-active')) el.classList.remove('ov-jv-active');
-  document.getElementById('ov-value-cycler')?.remove();
+  if (traceOwner === 'value') clearTrace();
 }
 
 function clearBulkHighlights(): void {
+  if (traceOwner === 'bulk') clearTrace();
   for (const el of bulkHighlightEls) el.classList.remove('ov-value-match');
   bulkHighlightEls = [];
+  bulkScoped = false;
+  bulkSteppable = 0;
   bulkHighlightRowId = -1;
+  syncRevealBar();
+}
+
+// Search only the request's render footprint; the same value elsewhere on the
+// page isn't attributed to this response, so it isn't highlighted. With no
+// footprint the search is page-wide. Footprint searches match strictly, and so
+// do page-wide searches for a response read during page load — there's no way
+// to tell what it rendered, so only exact values are worth showing.
+interface ScopedMatches { els: HTMLElement[]; scoped: boolean }
+
+function searchFootprint(
+  id: number, search: (roots: Element[] | null, strict: boolean) => HTMLElement[],
+): ScopedMatches {
+  const roots = liveFootprint(id);
+  return { els: search(roots, roots !== null || loadPhaseReads.has(id)), scoped: roots !== null };
 }
 
 function clearJvHover(): void {
@@ -1300,16 +1664,22 @@ function runBulkHighlight(rowId: number): void {
   if (parsed === undefined) return;
   const leaves: Array<{value: string; kind: string}> = [];
   collectJsonLeaves(parsed, leaves);
-  const matches = findMultipleValuesInDom(leaves);
-  bulkHighlightEls = matches;
+  const m = searchFootprint(rowId, (roots, strict) => findMultipleValuesInDom(leaves, roots, strict));
+  bulkHighlightEls = m.els.sort(byDocumentOrder);
+  bulkScoped = m.scoped;
   bulkHighlightRowId = rowId;
-  for (const el of matches) el.classList.add('ov-value-match');
+  for (const el of m.els) el.classList.add('ov-value-match');
+  bulkSteppable = bulkHighlightEls.filter(isSteppable).length;
 }
 
 // The value-trace cycler: floats over the page beside the current match, naming
 // the traced value and offering ‹ › to step through the rest. A zero-match state
 // still shows, anchored to the panel, so "not on this screen" is an answer too.
 function setValueStatusBadge(jv: HTMLElement, total: number, index: number): void {
+  setCyclerBadge(safeDecodeURIComponent(jv.dataset.ovVal ?? ''), total, index);
+}
+
+function setCyclerBadge(value: string, total: number, index: number): void {
   let el = document.getElementById('ov-value-cycler');
   if (!el) {
     el = document.createElement('div');
@@ -1318,9 +1688,9 @@ function setValueStatusBadge(jv: HTMLElement, total: number, index: number): voi
     el.addEventListener('click', onValueCyclerClick);
     document.documentElement.appendChild(el);
   }
-  const label = middleTruncate(safeDecodeURIComponent(jv.dataset.ovVal ?? ''), 28);
+  const label = middleTruncate(value, 28);
   const nav = total > 1
-    ? `<span class="ov-vc-nav"><button class="ov-vc-btn" data-step="-1">‹</button><span class="ov-vc-pos">${index + 1} / ${total}</span><button class="ov-vc-btn" data-step="1">›</button></span>`
+    ? `<span class="ov-vc-nav"><button class="ov-vc-btn" data-step="-1">‹</button><span class="ov-vc-pos">${tracePosLabel()}</span><button class="ov-vc-btn" data-step="1">›</button></span>`
     : `<span class="ov-vc-pos">${total === 1 ? '1 match' : 'not on this screen'}</span>`;
   el.dataset.empty = total === 0 ? '1' : '';
   el.innerHTML = `<span class="ov-vc-val">${escHtml(label)}</span><span class="ov-vc-lbl">match</span>${nav}`;
@@ -1338,13 +1708,148 @@ function setValueStatusBadge(jv: HTMLElement, total: number, index: number): voi
 function onValueCyclerClick(e: Event): void {
   const btn = (e.target as Element).closest<HTMLElement>('.ov-vc-btn');
   const step = Number(btn?.dataset.step);
-  const total = valueHighlightEls.length;
-  if (!Number.isFinite(step) || total < 2) return;
+  if (!Number.isFinite(step)) return;
   e.stopPropagation();
-  valueHighlightIndex = (valueHighlightIndex + step + total) % total;
+  stepTrace(step);
+}
+
+// "3 / 12", or "3 / 50+" when the match cap cut the search short.
+function tracePosLabel(): string {
+  return `${traceIndex + 1} / ${traceEls.length}${traceCapped ? '+' : ''}`;
+}
+
+// Move the stepper by `step`, skipping matches the page has since removed.
+function stepTrace(step: number): void {
+  traceEls = traceEls.filter(el => el.isConnected);
+  const total = traceEls.length;
+  if (total === 0) { clearTrace(); return; }
+  traceIndex = ((traceIndex + step) % total + total) % total;
   focusValueHighlight();
   const pos = document.querySelector('#ov-value-cycler .ov-vc-pos');
-  if (pos) pos.textContent = `${valueHighlightIndex + 1} / ${total}`;
+  if (pos) pos.textContent = tracePosLabel();
+  syncRevealBar();
+}
+
+// Reveal-all's controls live in the response bar, so navigation stays in the
+// overlay; only the highlights themselves are on the page. Four states:
+//   not highlighted → "reveal all values on page" button
+//   no matches      → a note
+//   matches         → a note-button saying ‹ › will take you to them, plus ‹ ›
+//   navigating      → that button becomes a "3 / 11 ×" pill, ‹ › stay beside it
+function revealBarHtml(id: number): string {
+  if (bulkHighlightRowId !== id) {
+    return '<button class="ov-reveal-all">⊹ reveal all values on page</button>';
+  }
+  const n = bulkHighlightEls.length;
+  if (n === 0) return '<span class="ov-reveal-note">⊹ no values from this response on this page</span>';
+  const matches = `${n}${n >= MAX_VALUE_HIGHLIGHTS ? '+' : ''} match${n === 1 ? '' : 'es'}`;
+  if (bulkSteppable === 0) return `<span class="ov-reveal-note">⊹ ${matches} on this page, none visible</span>`;
+  const arrows = '<button class="ov-rn-btn" data-step="-1" title="Previous match ( [ )">‹</button>'
+    + '<button class="ov-rn-btn" data-step="1" title="Next match ( ] )">›</button>';
+  if (traceOwner !== 'bulk' || traceEls.length === 0) {
+    return `<button class="ov-reveal-info" data-step="1" title="Go to the first match">⊹ ${matches} on this page — use ‹ › to go to ${n === 1 ? 'it' : 'them'}</button>${arrows}`;
+  }
+  return `<span class="ov-reveal-pill"><span class="ov-rn-pos">${tracePosLabel()}</span>`
+    + `<button class="ov-rn-end" title="Stop navigating">×</button></span>${arrows}`;
+}
+
+function syncRevealBar(): void {
+  for (const group of document.querySelectorAll<HTMLElement>('#ov-panel .ov-reveal-group')) {
+    group.innerHTML = revealBarHtml(Number(group.dataset.id));
+  }
+}
+
+// ‹ / › (or the matches note): the first press starts navigating — › from the
+// first match, ‹ from the last — and later presses step.
+function navigateReveal(id: number, step: number): void {
+  if (bulkHighlightRowId !== id) return;
+  if (traceOwner === 'bulk') stepTrace(step);
+  else startBulkTrace(step);
+}
+
+function revealAll(id: number): void {
+  clearValueHighlights();
+  runBulkHighlight(id);
+  syncRevealBar();
+}
+
+function byDocumentOrder(a: Node, b: Node): number {
+  if (a === b) return 0;
+  return a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+}
+
+// Worth stepping to: laid out and not visibility:hidden. Hidden matches (closed
+// accordions, inactive tabs) keep their highlight but scrolling to them shows
+// nothing, so the stepper passes over them.
+function isSteppable(el: HTMLElement): boolean {
+  if (el.getClientRects().length === 0) return false;
+  return getComputedStyle(el).visibility !== 'hidden';
+}
+
+// Start stepping through the bulk matches at the first (› ) or last (‹) one
+// that is laid out. If none are any more, the bar says so instead.
+function startBulkTrace(step: number): void {
+  const els = nearTriggerFirst(bulkHighlightEls.filter(isSteppable), bulkHighlightRowId);
+  bulkSteppable = els.length;
+  if (els.length === 0) { syncRevealBar(); return; }
+  clearValueHighlights();
+  traceEls = els;
+  traceOwner = 'bulk';
+  traceCapped = bulkHighlightEls.length >= MAX_VALUE_HIGHLIGHTS;
+  traceIndex = step < 0 ? els.length - 1 : 0;
+  outlineRenderArea(bulkHighlightRowId);
+  focusValueHighlight();
+  syncRevealBar();
+}
+
+// Trigger tiebreak: for a request a click started, matches in the same form,
+// dialog, section or list as the clicked element come first, then the rest; each
+// group keeps page order. A tiebreak, not a filter — results often render away
+// from the button that asked for them.
+const TRIGGER_CONTAINER = 'form, dialog, [role="dialog"], [role="listbox"], [role="menu"], [role="grid"], '
+  + 'section, article, aside, nav, table, ul, ol';
+
+function triggerContainer(id: number): Element | null {
+  const sel = requests.get(id)?.element?.selector;
+  if (!sel) return null;
+  let el: Element | null = null;
+  try { el = document.querySelector(sel); } catch { return null; }
+  return el?.closest(TRIGGER_CONTAINER) ?? null;
+}
+
+function nearTriggerFirst(els: HTMLElement[], id: number): HTMLElement[] {
+  const box = triggerContainer(id);
+  if (!box) return els;
+  return [...els.filter(el => box.contains(el)), ...els.filter(el => !box.contains(el))];
+}
+
+// While navigating, faintly outline the request's render footprint, so the part
+// of the page the search was limited to is visible. Nothing for page-wide searches.
+
+function outlineRenderArea(id: number): void {
+  clearRenderArea();
+  renderAreaEls = liveFootprint(id) ?? [];
+  for (const el of renderAreaEls) el.classList.add('ov-render-area');
+}
+
+function clearRenderArea(): void {
+  for (const el of renderAreaEls) el.classList.remove('ov-render-area');
+  renderAreaEls = [];
+}
+
+// ] / [ step the active trace, mirroring the stepper's › / ‹. Ignored while the
+// user is typing, and with modifiers held (browser and ghost-mode shortcuts).
+function onTraceKey(e: KeyboardEvent): void {
+  if (e.key !== ']' && e.key !== '[') return;
+  if (traceEls.length < 2 || e.altKey || e.ctrlKey || e.metaKey) return;
+  if (isEditableTarget(e.target)) return;
+  e.preventDefault();
+  stepTrace(e.key === ']' ? 1 : -1);
+}
+
+function isEditableTarget(t: EventTarget | null): boolean {
+  if (!(t instanceof HTMLElement)) return false;
+  return t.isContentEditable || t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT';
 }
 
 function handleJsonValueClick(jv: HTMLElement): void {
@@ -1355,17 +1860,19 @@ function handleJsonValueClick(jv: HTMLElement): void {
   const kind = jv.dataset.ovKind ?? 'string';
   const key = `${rowId}|${kind}|${encVal}`;
   const value = safeDecodeURIComponent(encVal);
-  if (key === valueHighlightKey && valueHighlightEls.length > 1) {
-    valueHighlightIndex = (valueHighlightIndex + 1) % valueHighlightEls.length;
-    focusValueHighlight();
-    setValueStatusBadge(jv, valueHighlightEls.length, valueHighlightIndex);
+  if (key === valueHighlightKey && traceEls.length > 1) {
+    stepTrace(1);
+    setValueStatusBadge(jv, traceEls.length, traceIndex);
     return;
   }
   clearValueHighlights();
-  const matches = findValuesInDom(value, kind);
+  const matches = searchFootprint(Number(rowId), (roots, strict) => findValuesInDom(value, kind, roots, strict)).els;
   valueHighlightKey = key;
   valueHighlightEls = matches;
-  valueHighlightIndex = 0;
+  traceEls = matches.slice();
+  traceIndex = 0;
+  traceOwner = 'value';
+  traceCapped = false;
   for (const el of matches) el.classList.add('ov-value-match');
   if (matches.length > 0) focusValueHighlight();
   jv.classList.add('ov-jv-active');
@@ -1390,7 +1897,7 @@ function reattachValueHighlight(): void {
     const viewBot = viewTop + v.host.clientHeight;
     if (lineTop < viewTop || lineTop + JSON_LINE_HEIGHT > viewBot) v.scrollToRow(idx);
     const span = v.host.querySelector<HTMLElement>(`.ov-jv[data-ov-kind="${kind}"][data-ov-val="${encVal}"]`);
-    if (span) setValueStatusBadge(span, valueHighlightEls.length, valueHighlightIndex);
+    if (span) setValueStatusBadge(span, traceEls.length, traceIndex);
     return;
   }
 
@@ -1400,7 +1907,7 @@ function reattachValueHighlight(): void {
   );
   if (!span) { clearValueHighlights(); return; }
   span.classList.add('ov-jv-active');
-  setValueStatusBadge(span, valueHighlightEls.length, valueHighlightIndex);
+  setValueStatusBadge(span, traceEls.length, traceIndex);
 }
 
 // ── Row + detail HTML ─────────────────────────────────────────────────────────
@@ -1515,7 +2022,7 @@ function responseBodyHtml(req: ApiRequest): string {
   const size = bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`;
   const bar = `<div class="ov-body-bar">
       <span class="ov-body-meta">json · ${size}</span>
-      <button class="ov-reveal-all${bulkHighlightRowId === req.id ? ' on' : ''}" data-id="${req.id}">⊹ reveal all values on page</button>
+      <span class="ov-reveal-group" data-id="${req.id}">${revealBarHtml(req.id)}</span>
     </div>`;
   // The tree itself is mounted by the virtualizer once the pane is in the DOM.
   return `${truncNote}${bar}<div class="ov-body-json" data-id="${req.id}"></div>`;
@@ -2080,10 +2587,14 @@ function onListClick(e: Event): void {
     return;
   }
 
-  const revealAll = target.closest<HTMLElement>('.ov-reveal-all');
-  if (revealAll) {
+  const revealGroup = target.closest<HTMLElement>('.ov-reveal-group');
+  if (revealGroup) {
     e.stopPropagation();
-    toggleRevealAll(revealAll);
+    const id = Number(revealGroup.dataset.id);
+    const stepBtn = target.closest<HTMLElement>('[data-step]');
+    if (stepBtn) navigateReveal(id, Number(stepBtn.dataset.step));
+    else if (target.closest('.ov-rn-end')) clearTrace();
+    else if (target.closest('.ov-reveal-all')) revealAll(id);
     return;
   }
 
@@ -2110,25 +2621,8 @@ function revealElement(selector: string): void {
 }
 
 // "Reveal all values on page" — the whole-response counterpart to clicking one
-// JSON value. Reports how many matches were found on the button itself.
-function toggleRevealAll(btn: HTMLElement): void {
-  const id = Number(btn.dataset.id);
-  if (!Number.isFinite(id)) return;
-  if (bulkHighlightRowId === id) {
-    clearBulkHighlights();
-    btn.classList.remove('on');
-    btn.textContent = '⊹ reveal all values on page';
-    return;
-  }
-  clearValueHighlights();
-  runBulkHighlight(id);
-  btn.classList.add('on');
-  const n = bulkHighlightEls.length;
-  btn.textContent = n === 0
-    ? '⊹ no values from this response on the page'
-    : `⊹ ${n} value${n === 1 ? '' : 's'} revealed on page`;
-}
-
+// JSON value. Reports how many matches were found on the button itself, and
+// steps through them with the same ‹ › stepper.
 function bindChipDelegation(container: HTMLElement): void {
   container.addEventListener('click', (e: Event) => {
     const chip = (e.target as Element).closest<HTMLElement>('.ov-chip');
@@ -2218,6 +2712,7 @@ function dockAsPill(panel: HTMLElement | null, pill: HTMLElement | null): void {
 function setDockState(next: DockState): void {
   if (next === dockState) return;
   dockState = next;
+  resetPanelDodge();
   chrome.storage.local.set({ ovDockState: next });
   const panel = $('ov-panel');
   const pill = $('ov-pill');
@@ -2407,6 +2902,7 @@ function buildPanel(): void {
     requests.clear(); requestsRev++; expandedIds.clear(); detailTabs.clear(); pinnedIds.clear();
     clearAllBadges(); clearValueHighlights(); clearBulkHighlights();
     clearJvHover(); clearRevHighlight();
+    clearFootprints();
     clearPreserved();
     smReset();
     renderList();
@@ -2942,6 +3438,7 @@ function makeDraggable(panel: HTMLElement, handle: HTMLElement): void {
     // grabbing it must land in the input rather than drag the panel away.
     if ((e.target as Element).closest('button, input, textarea, select, [contenteditable], .ov-search')) return;
     e.preventDefault();
+    commitPanelDodge(panel);
     const rect0 = panel.getBoundingClientRect();
     ox = e.clientX - rect0.left;
     oy = e.clientY - rect0.top;
@@ -2973,6 +3470,7 @@ function makeResizable(panel: HTMLElement): void {
     const dir = handle.dataset.dir ?? '';
     e.preventDefault();
     e.stopPropagation();
+    commitPanelDodge(panel);
     const rect = panel.getBoundingClientRect();
     panel.style.setProperty('left', `${rect.left}px`, 'important');
     panel.style.setProperty('top', `${rect.top}px`, 'important');
@@ -3804,11 +4302,53 @@ function injectStyles(): void {
       text-align: center !important;
     }
     .ov-reveal-all:hover { background: rgba(78,201,165,.18) !important; }
-    .ov-reveal-all.on {
+    .ov-reveal-group { display: inline-flex !important; align-items: center !important; gap: 6px !important; }
+    .ov-rn-pos { min-width: 3.5em !important; text-align: center !important; font-variant-numeric: tabular-nums !important; }
+    .ov-rn-btn {
+      all: unset !important;
+      cursor: pointer !important;
+      font-family: inherit !important;
+      font-size: calc(12px * var(--ov-font-scale,1)) !important;
+      line-height: 1 !important;
+      color: var(--ov-trace) !important;
+      padding: 2px 6px !important;
+      border-radius: 4px !important;
+    }
+    .ov-rn-btn:hover { background: var(--ov-trace-bg) !important; }
+    .ov-reveal-info {
+      all: unset !important;
+      cursor: pointer !important;
+      font-family: inherit !important;
+      font-size: calc(9.5px * var(--ov-font-scale,1)) !important;
       color: var(--ov-trace) !important;
       background: var(--ov-trace-bg) !important;
-      border-color: var(--ov-trace-bd) !important;
+      border: 1px dashed var(--ov-trace-bd) !important;
+      padding: 3px 9px !important;
+      border-radius: 6px !important;
     }
+    .ov-reveal-note { font-size: calc(9.5px * var(--ov-font-scale,1)) !important; color: var(--ov-text-faint) !important; }
+    .ov-reveal-pill {
+      display: inline-flex !important;
+      align-items: center !important;
+      gap: 4px !important;
+      font-size: calc(9.5px * var(--ov-font-scale,1)) !important;
+      color: var(--ov-trace) !important;
+      background: var(--ov-trace-bg) !important;
+      border: 1px solid var(--ov-trace-bd) !important;
+      padding: 2px 4px 2px 10px !important;
+      border-radius: 20px !important;
+      animation: ov-pill-in 160ms ease-out !important;
+    }
+    @keyframes ov-pill-in { from { transform: scale(.85); opacity: .4; } to { transform: none; opacity: 1; } }
+    .ov-rn-end {
+      all: unset !important;
+      cursor: pointer !important;
+      font-family: inherit !important;
+      padding: 0 5px !important;
+      border-radius: 20px !important;
+      color: var(--ov-trace) !important;
+    }
+    .ov-rn-end:hover { background: var(--ov-trace-bd) !important; }
 
     /* ── JSON tree ── */
     .ov-body-json {
@@ -4155,6 +4695,8 @@ function injectStyles(): void {
     /* ══ Ghost mode ═════════════════════════════════════════════════════════ */
     .ov-ghost { opacity: 0.25 !important; transition: opacity 100ms !important; pointer-events: auto !important; }
     .ov-ghost:hover { opacity: 1 !important; }
+    #ov-panel.ov-dodge-anim { transition: transform 180ms ease-out, opacity 100ms !important; }
+    #ov-panel.ov-trace-fade { opacity: 0.6 !important; }
 
     /* ══ On the page itself ═════════════════════════════════════════════════ */
     .ov-highlighted {
@@ -4173,6 +4715,10 @@ function injectStyles(): void {
       background: rgba(138,91,255,.18) !important;
       box-shadow: 0 0 0 2px rgba(138,91,255,.45) !important;
       border-radius: 4px !important;
+    }
+    .ov-render-area {
+      outline: 1px dashed rgba(138,91,255,.35) !important;
+      outline-offset: 3px !important;
     }
     .ov-value-current {
       background: rgba(138,91,255,.26) !important;
@@ -4468,6 +5014,7 @@ function activateOverlay(): void {
   signalInjected('start');
 
   const init = () => {
+    startMutationLog();
     loadFont().then(({ family, size }) => applyFont(family, size));
     loadTheme().then(applyLoadedTheme);
   };
@@ -4551,6 +5098,7 @@ function deactivateOverlay(): void {
   clearValueHighlights();
   clearBulkHighlights();
   clearJvHover();
+  stopMutationLog();
   requests.clear();
   expandedIds.clear();
   detailTabs.clear();
@@ -4569,6 +5117,8 @@ function deactivateOverlay(): void {
 }
 
 // ── Ghost mode ────────────────────────────────────────────────────────────────
+
+window.addEventListener('keydown', onTraceKey);
 
 window.addEventListener('keydown', (e: KeyboardEvent) => {
   if (e.key !== 'Alt' || ghostHeld) return;
