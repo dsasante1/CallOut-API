@@ -2,7 +2,8 @@
 
 interface ElementInfo { selector: string; label: string; }
 interface WsMessage { dir: 'sent' | 'recv'; body: string; ts: number; }
-type RequestStatus = number | 'pending' | 'error' | 'closed';
+// 'sent' is a beacon the browser queued; it never reports the server's answer.
+type RequestStatus = number | 'pending' | 'error' | 'closed' | 'sent';
 type HeaderPair = [string, string];
 type DetailTab = 'response' | 'request' | 'headers' | 'timing' | 'frames';
 type DockState = 'panel' | 'pill' | 'hidden';
@@ -16,7 +17,9 @@ interface ApiRequest {
   id: number;
   url: string;
   method: string;
-  kind: 'fetch' | 'xhr' | 'ws';
+  // 'nav' rows (document loads, form POSTs, their redirects) come from
+  // chrome.webRequest in the background worker, not the page hook.
+  kind: 'fetch' | 'xhr' | 'ws' | 'sse' | 'beacon' | 'nav';
   status: RequestStatus;
   element?: ElementInfo | null;
   ts: number;
@@ -37,6 +40,8 @@ interface ApiRequest {
   resHeaders?: HeaderPair[] | null;
   messages?: WsMessage[];
   ms?: number;
+  // Shown in place of a response body that cannot be captured (nav rows).
+  note?: string;
   _lcUrl?: string;
   _lcReqBody?: string;
   _lcResBody?: string;
@@ -215,6 +220,16 @@ const dirtyPreserveIds = new Set<number>();
 const pendingWsMessages = new Map<number, WsMessage[]>();
 let preserveTimer: number | null = null;
 let nextPreservedLocalId = -1;
+// Ids at or above this belong to rows the background worker records itself
+// (navigations, from chrome.webRequest). Keep in sync with BG_NAV_ID_BASE in
+// src/background.ts. Such rows already live in the preserve store, so they are
+// never sent back to it, and they keep their id when restored so later updates
+// from the worker still find them.
+const NAV_ID_BASE = 1e12;
+
+function isBgOwnedId(id: number): boolean {
+  return id >= NAV_ID_BASE;
+}
 
 function schedulePreserveFlush(): void {
   if (preserveTimer !== null) return;
@@ -222,6 +237,7 @@ function schedulePreserveFlush(): void {
 }
 
 function markPreserveDirty(id: number): void {
+  if (isBgOwnedId(id)) return;
   dirtyPreserveIds.add(id);
   schedulePreserveFlush();
 }
@@ -315,15 +331,14 @@ function hydrateFromPreserved(onDone: () => void): void {
         // Remap to negative local IDs so they never collide with the per-page
         // injected counter (which restarts at 1 after navigation).
         for (const r of list) {
-          const localId = nextPreservedLocalId--;
+          // A worker-owned row may already be here from a live update, which is
+          // never older than the stored copy.
+          if (isBgOwnedId(r.id) && requests.has(r.id)) continue;
+          const localId = isBgOwnedId(r.id) ? r.id : nextPreservedLocalId--;
           const copy: ApiRequest = { ...r, id: localId };
           refreshSearchCache(copy, copy as OverlayMessage);
           if (pinnedKeys.has(pinKey(copy))) pinnedIds.add(localId);
           requests.set(localId, copy);
-          // Restored rows carry their original pageUrl, so they rebuild the map
-          // for pages visited earlier in this tab's history.
-          copy._smFolded = false;
-          smFoldRequest(copy);
           // Restored rows carry their original pageUrl, so they rebuild the map
           // for pages visited earlier in this tab's history.
           copy._smFolded = false;
@@ -404,6 +419,13 @@ function isSafeId(v: unknown): v is number {
 const preActivationBuffer: OverlayMessage[] = [];
 const MAX_PREACTIVATION_BUFFER = 2000;
 
+// `activated` flips before the buffer is replayed (that waits for the preserve
+// store), so a message arriving in between must queue behind the buffered ones —
+// handled live, a completion would be overwritten by its own older 'pending'.
+function mustBuffer(): boolean {
+  return !activated || preActivationBuffer.length > 0;
+}
+
 function bufferPreActivation(msg: OverlayMessage): void {
   preActivationBuffer.push(msg);
   if (preActivationBuffer.length > MAX_PREACTIVATION_BUFFER) preActivationBuffer.shift();
@@ -453,7 +475,8 @@ function updateExistingRequest(existing: ApiRequest, msg: OverlayMessage): void 
 function insertNewRequest(msg: OverlayMessage): void {
   // Stamped here rather than in the injected hook, so an SPA route change is
   // reflected without the hook needing to watch history.
-  const fresh = { ...msg, pageUrl: location.href } as ApiRequest;
+  // Nav rows arrive with pageUrl already set: the document they loaded.
+  const fresh = { ...msg, pageUrl: msg.pageUrl ?? location.href } as ApiRequest;
   refreshSearchCache(fresh, msg);
   requests.set(fresh.id, fresh);
   requestsRev++;   // new triggering-element → id mapping
@@ -472,15 +495,6 @@ function handleOverlayMessage(msg: OverlayMessage): void {
     updateExistingRequest(existing, msg);
   } else {
     if (msg.readTs !== undefined) return;   // read report for a trimmed/unknown request
-    if (paused) return;
-    const fresh = { ...msg, pageUrl: location.href } as ApiRequest;
-    refreshSearchCache(fresh, msg);
-    requests.set(msg.id, fresh);
-    requestsRev++;   // new triggering-element → id mapping
-    // restore pin state from persisted keys
-    if (pinnedKeys.has(pinKey(fresh))) pinnedIds.add(fresh.id);
-    trimRequests();
-    markPreserveDirty(fresh.id);
     if (paused) return;   // pause gates new entries only
     insertNewRequest(msg);
   }
@@ -504,11 +518,24 @@ window.addEventListener('message', (e: MessageEvent<OverlayMessage>) => {
   if (TARGET_ORIGIN !== '*' && e.origin !== TARGET_ORIGIN) return;
   if (!e.data?.__apiOverlay) return;
   const msg = e.data;
+  // Ids in the worker's range are only ever issued by the worker. Restored nav
+  // rows keep those (predictable) ids, so a page script must not reach them.
+  if (isBgOwnedId(Number(msg.id ?? msg.wsId))) return;
   // Before activation there is no UI; hold captured requests so they can be
   // replayed once the overlay opens (drainPreActivationBuffer).
-  if (!activated) { bufferPreActivation(msg); return; }
+  if (mustBuffer()) { bufferPreActivation(msg); return; }
   handleOverlayMessage(msg);
 });
+
+// A navigation row from the background worker (chrome.webRequest). Same path
+// as the page hook's messages once it is here.
+function receiveNavRow(raw: unknown): void {
+  if (!raw || typeof raw !== 'object') return;
+  const msg = { ...(raw as OverlayMessage), kind: 'nav' } as OverlayMessage;
+  if (!isSafeId(msg.id) || !isBgOwnedId(msg.id)) return;
+  if (mustBuffer()) { bufferPreActivation(msg); return; }
+  handleOverlayMessage(msg);
+}
 
 chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, _sender, sendResponse) => {
   switch (msg.action) {
@@ -556,6 +583,10 @@ chrome.runtime.onMessage.addListener((msg: { action: string; value?: unknown }, 
       break;
     case 'export-har':
       exportHAR();
+      sendResponse({ ok: true });
+      break;
+    case 'ov-nav':
+      receiveNavRow(msg.value);
       sendResponse({ ok: true });
       break;
     case 'theme': {
@@ -898,6 +929,8 @@ function statusBucket(req: { status: RequestStatus; kind?: string }): string {
   const s = req.status;
   if (s === 'pending') return 'pending';
   if (s === 'error') return 'err';
+  // A queued beacon, or a stream (ws/sse) the page closed itself.
+  if (s === 'sent' || s === 'closed') return '2xx';
   if (req.kind === 'ws') return wsStatusBucket(s);
   return typeof s === 'number' ? httpStatusBucket(s) : 'err';
 }
@@ -1925,10 +1958,20 @@ function headerRowsHtml(label: string, headers: HeaderPair[] | null | undefined)
   </div>`;
 }
 
+function isStream(req: ApiRequest): boolean {
+  return req.kind === 'ws' || req.kind === 'sse';
+}
+
+function detailTabsFor(req: ApiRequest): DetailTab[] {
+  if (req.kind === 'ws') return ['frames', 'headers', 'request'];
+  // EventSource exposes no headers and sends no body.
+  if (req.kind === 'sse') return ['frames', 'timing'];
+  return ['response', 'request', 'headers', 'timing'];
+}
+
 function detailPanelHtml(req: ApiRequest): string {
-  const isWs = req.kind === 'ws';
-  const activeTab: DetailTab = detailTabs.get(req.id) ?? (isWs ? 'frames' : 'response');
-  const tabs: DetailTab[] = isWs ? ['frames', 'headers', 'request'] : ['response', 'request', 'headers', 'timing'];
+  const tabs = detailTabsFor(req);
+  const activeTab: DetailTab = detailTabs.get(req.id) ?? tabs[0];
 
   const tabIsCopyable = (
     (activeTab === 'response' && req.resBody != null) ||
@@ -2007,6 +2050,7 @@ function detailPaneHtml(req: ApiRequest, activeTab: DetailTab): string {
 
 function responseBodyHtml(req: ApiRequest): string {
   if (req.resBody == null) {
+    if (req.note) return `<div class="ov-body-none">${escHtml(req.note)}</div>`;
     return req.status === 'pending'
       ? '<div class="ov-body-none">Waiting…</div>'
       : '<div class="ov-body-none">No response body</div>';
@@ -2055,7 +2099,9 @@ function timingPaneHtml(req: ApiRequest): string {
       <div class="ov-kv-k">Started</div><div class="ov-kv-v">${escHtml(started)}</div>
       <div class="ov-kv-k">Kind</div><div class="ov-kv-v">${escHtml(req.kind ?? 'fetch')}</div>
     </div>
-    <div class="ov-kv-note">Measured from the page, so this is the whole round trip. A per-phase breakdown would need the browser's Resource Timing data, which this build does not read.</div>
+    <div class="ov-kv-note">${req.kind === 'nav'
+      ? 'Timed by the browser from request start to the last byte of the response.'
+      : 'Measured from the page, so this is the whole round trip. A per-phase breakdown would need the browser\'s Resource Timing data, which this build does not read.'}</div>
   </div>`;
 }
 
@@ -2081,10 +2127,19 @@ function formatDuration(ms: number | undefined): string {
 // Short, human-readable label for the initiator column: the element that fired
 // the request, or 'background' for anything outside the attribution window.
 function initiatorLabel(req: ApiRequest): string {
+  if (req.kind === 'nav') return 'navigation';
   if (!req.element) return 'background';
   const raw = req.element.label || req.element.selector || 'element';
   return middleTruncate(raw, 28);
 }
+
+// Kinds that are not an ordinary fetch/XHR get a tag after the path, since the
+// method column alone (GET, POST) cannot tell a page load from an API call.
+const KIND_TAGS: Partial<Record<ApiRequest['kind'], { label: string; tip: string }>> = {
+  nav:    { label: 'doc',    tip: 'Page navigation (document request or form submit)' },
+  beacon: { label: 'beacon', tip: 'navigator.sendBeacon — the server response is never visible' },
+  sse:    { label: 'sse',    tip: 'Server-sent events (EventSource)' },
+};
 
 function rowHtml(req: ApiRequest): string {
   const bucket = statusBucket(req);
@@ -2097,8 +2152,10 @@ function rowHtml(req: ApiRequest): string {
 
   const durLabel = formatDuration(req.ms);
 
-  const wsFr = req.kind === 'ws' && req.messages?.length
+  const wsFr = isStream(req) && req.messages?.length
     ? `<span class="ov-fr">${req.messages.length}fr</span>` : '';
+  const tag = KIND_TAGS[req.kind];
+  const kindTag = tag ? `<span class="ov-kind-tag" title="${tag.tip}">${tag.label}</span>` : '';
 
   return `<div class="ov-row${isExpanded ? ' ov-expanded' : ''}${isPinned ? ' ov-pinned' : ''}"
       data-id="${req.id}" data-sel="${encodeURIComponent(req.element?.selector ?? '')}"
@@ -2107,7 +2164,7 @@ function rowHtml(req: ApiRequest): string {
     <div class="ov-c ov-c-url">
       <span class="ov-init-dot${isPage ? '' : ' ov-init-bg'}"></span>
       <span class="ov-url-path">${escHtml(shortUrl)}</span>
-      ${wsFr}
+      ${kindTag}${wsFr}
     </div>
     <div class="ov-c ov-c-init${isPage ? '' : ' ov-init-bg'}">${isPage ? '◍' : '◌'} ${escHtml(initiatorLabel(req))}</div>
     <div class="ov-c ov-c-status s-${bucket}">${statusLabel}</div>
@@ -2757,7 +2814,7 @@ function pillTickClass(r: ApiRequest): string {
   const b = statusBucket(r);
   if (b === '4xx' || b === '5xx' || b === 'err') return 'err';
   if (b === '3xx') return 'warn';
-  return r.kind === 'ws' ? 'ws' : '';
+  return isStream(r) ? 'ws' : '';
 }
 
 function pillInnerHtml(): string {
@@ -3000,7 +3057,7 @@ function exportHAR(): void {
     hs ? hs.map(([name, value]) => ({ name, value })) : [];
 
   const entries = [...requests.values()]
-    .filter(r => r.kind !== 'ws' && typeof r.status === 'number')
+    .filter(r => !isStream(r) && typeof r.status === 'number')
     .map(r => ({
       startedDateTime: new Date(r.ts || Date.now()).toISOString(),
       time: r.ms ?? 0,
@@ -3982,6 +4039,7 @@ function injectStyles(): void {
     .ov-url-path { color: var(--ov-text-dim) !important; overflow: hidden !important; text-overflow: ellipsis !important; }
     .ov-row.ov-expanded .ov-url-path { color: var(--ov-title) !important; }
     .ov-fr { font-size: calc(9px * var(--ov-font-scale,1)) !important; color: var(--ov-m-ws) !important; flex-shrink: 0 !important; }
+    .ov-kind-tag { font-size: calc(9px * var(--ov-font-scale,1)) !important; color: var(--ov-text-ghost) !important; border: 1px solid currentColor !important; border-radius: 3px !important; padding: 0 3px !important; line-height: 1.3 !important; flex-shrink: 0 !important; }
     .ov-c-init {
       font-size: calc(10px * var(--ov-font-scale,1)) !important;
       color: var(--ov-trace) !important;

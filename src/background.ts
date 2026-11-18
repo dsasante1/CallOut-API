@@ -15,8 +15,8 @@ interface PreservedRequest {
   id: number;
   url: string;
   method: string;
-  kind: 'fetch' | 'xhr' | 'ws';
-  status: number | 'pending' | 'error' | 'closed';
+  kind: 'fetch' | 'xhr' | 'ws' | 'sse' | 'beacon' | 'nav';
+  status: number | 'pending' | 'error' | 'closed' | 'sent';
   element?: unknown;
   ts: number;
   reqBody?: string | null;
@@ -26,6 +26,7 @@ interface PreservedRequest {
   messages?: BgWsMessage[];
   ms?: number;
   pageUrl?: string;
+  note?: string;
 }
 
 const BG_MAX_REQUESTS_PER_TAB = 1000;
@@ -181,9 +182,10 @@ async function smHandleScan(url: string): Promise<PreservedRequest[]> {
     await smWaitForLoad(tabId);
     // Load-time XHRs fire after 'complete'; give them a moment to land.
     await new Promise(r => setTimeout(r, SM_SCAN_SETTLE_MS));
-    // Harvest *before* the tab is removed — onRemoved wipes its store.
+    // Harvest *before* the tab is removed — onRemoved wipes its store. The
+    // page's own document load is not a call the page makes.
     const store = await getTabStore(tabId);
-    return Array.from(store.values());
+    return Array.from(store.values()).filter(r => r.kind !== 'nav');
   } catch {
     return [];
   } finally {
@@ -247,6 +249,193 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 chrome.tabs.onRemoved.addListener((tabId) => {
+  for (const [rid, f] of bgNavFlights) if (f.tabId === tabId) bgNavFlights.delete(rid);
   preservedByTab.delete(tabId);
   chrome.storage.session.remove(storageKey(tabId)).catch(() => { /* see persistTabStore */ });
 });
+
+// ── Navigation capture (chrome.webRequest) ───────────────────────────────────
+//
+// The page hook only sees requests the page's own JS makes. A document load, a
+// classic <form> submit and the redirects that follow go through the browser's
+// navigation instead, so they are observed here and written straight into the
+// tab's preserve store — the page that started a navigation is about to unload,
+// and the next one restores the rows from the store. MV3 webRequest cannot read
+// response bodies, so a row has URL, method, form body, headers, status, timing.
+//
+// Only navigations to or from an allowlisted host are recorded, matching the
+// overlay, which is dormant everywhere else.
+
+// Keep in sync with NAV_ID_BASE in src/content.ts. Row id = base + requestId *
+// hops + hop: unique for the browser session, which is as long as
+// storage.session (and so the preserve store) lives.
+const BG_NAV_ID_BASE = 1e12;
+const BG_NAV_MAX_HOPS = 32;
+const BG_NAV_MAX_BODY = 256_000;
+const BG_NAV_NOTE = "The browser loaded this document itself; extensions can't read a page's HTML response.";
+
+interface BgNavFlight { tabId: number; base: number; hop: number; rec: PreservedRequest; }
+
+// Keyed by webRequest's requestId, which stays the same across redirects.
+const bgNavFlights = new Map<string, BgNavFlight>();
+let bgNavFallbackSeq = 0;
+
+let bgAllowedHosts: Promise<string[]> | null = null;
+
+function bgGetAllowedHosts(): Promise<string[]> {
+  bgAllowedHosts ??= chrome.storage.local.get('ovAllowedHosts')
+    .then(r => (Array.isArray(r.ovAllowedHosts) ? r.ovAllowedHosts as string[] : []))
+    .catch(() => []);
+  return bgAllowedHosts;
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.ovAllowedHosts) bgAllowedHosts = null;
+});
+
+// Same rule as hostAllowed in content.ts, applied to a URL or an origin.
+function bgHostAllowed(hosts: string[], url: string | undefined): boolean {
+  if (!url) return false;
+  let host: string;
+  try { host = new URL(url).hostname; } catch { return false; }
+  return !!host && hosts.some(h => h === host || host.endsWith('.' + h));
+}
+
+function bgNavBody(body: chrome.webRequest.WebRequestBody | null | undefined): string | null {
+  if (!body) return null;
+  if (body.error) return `[${body.error}]`;
+  if (body.formData) {
+    const params = new URLSearchParams();
+    for (const [name, values] of Object.entries(body.formData)) {
+      for (const v of values) params.append(name, String(v));
+    }
+    return params.toString().slice(0, BG_NAV_MAX_BODY);
+  }
+  if (body.raw?.length) {
+    const decoder = new TextDecoder('utf-8', { fatal: false });
+    return body.raw
+      .map(part => (part.bytes ? decoder.decode(part.bytes) : part.file ? `[file ${part.file}]` : ''))
+      .join('')
+      .slice(0, BG_NAV_MAX_BODY) || null;
+  }
+  return null;
+}
+
+function bgHeaderPairs(headers: chrome.webRequest.HttpHeader[] | undefined): Array<[string, string]> | null {
+  return headers?.length ? headers.map(h => [h.name, h.value ?? ''] as [string, string]) : null;
+}
+
+function bgNavRecord(f: BgNavFlight, url: string, method: string, ts: number, reqBody: string | null): PreservedRequest {
+  return {
+    id: f.base + f.hop, url, method: method.toUpperCase(), kind: 'nav', status: 'pending',
+    element: null, ts: Math.round(ts), reqBody, pageUrl: url, note: BG_NAV_NOTE,
+  };
+}
+
+// Store first, then tell the page: a page that loads in between restores the row
+// from the store, and a live update is never older than what it restored.
+async function bgNavSave(f: BgNavFlight): Promise<void> {
+  const rec = { ...f.rec };
+  const store = await getTabStore(f.tabId);
+  store.set(rec.id, rec);
+  trimStore(store);
+  await persistTabStore(f.tabId, store);
+  chrome.tabs.sendMessage(f.tabId, { action: 'ov-nav', value: rec }, { frameId: 0 })
+    .catch(() => { /* no content script in the frame (yet, or ever) */ });
+}
+
+function bgNavFinish(f: BgNavFlight, ts: number, patch: Partial<PreservedRequest>): void {
+  Object.assign(f.rec, patch, { ms: Math.max(0, Math.round(ts - f.rec.ts)) });
+}
+
+async function bgNavOnBeforeRequest(d: chrome.webRequest.WebRequestBodyDetails): Promise<void> {
+  if (d.tabId < 0) return;
+  // A prerendered page may never be shown; it would leave a phantom row.
+  if ((d as { documentLifecycle?: string }).documentLifecycle === 'prerender') return;
+  const reqBody = bgNavBody(d.requestBody);
+  const f = bgNavFlights.get(d.requestId);
+  if (f) {
+    // The redirect hop was already opened in onBeforeRedirect; fill in what
+    // the browser actually sent.
+    if (f.rec.status === 'pending' && f.rec.url === d.url) {
+      f.rec.method = d.method.toUpperCase();
+      if (reqBody != null) f.rec.reqBody = reqBody;
+      await bgNavSave(f);
+    }
+    return;
+  }
+  const hosts = await bgGetAllowedHosts();
+  if (!bgHostAllowed(hosts, d.url) && !bgHostAllowed(hosts, d.initiator)) return;
+  const n = Number(d.requestId);
+  const seq = Number.isSafeInteger(n) && n >= 0 ? n : 1e9 + ++bgNavFallbackSeq;
+  const flight: BgNavFlight = { tabId: d.tabId, base: BG_NAV_ID_BASE + seq * BG_NAV_MAX_HOPS, hop: 0, rec: null as unknown as PreservedRequest };
+  flight.rec = bgNavRecord(flight, d.url, d.method, d.timeStamp, reqBody);
+  bgNavFlights.set(d.requestId, flight);
+  await bgNavSave(flight);
+}
+
+async function bgNavOnSendHeaders(d: chrome.webRequest.WebRequestHeadersDetails): Promise<void> {
+  const f = bgNavFlights.get(d.requestId);
+  if (!f) return;
+  f.rec.reqHeaders = bgHeaderPairs(d.requestHeaders);
+  await bgNavSave(f);
+}
+
+// 307/308 resend the same method and body; 303 (and, by long-standing browser
+// behaviour, 301/302 after a POST) turn it into a GET without a body.
+function bgRedirectMethod(status: number, method: string): string {
+  if (status === 307 || status === 308) return method;
+  if (status === 303 && method !== 'HEAD') return 'GET';
+  if ((status === 301 || status === 302) && method === 'POST') return 'GET';
+  return method;
+}
+
+async function bgNavOnBeforeRedirect(d: chrome.webRequest.WebRedirectionResponseDetails): Promise<void> {
+  const f = bgNavFlights.get(d.requestId);
+  if (!f) return;
+  bgNavFinish(f, d.timeStamp, {
+    status: d.statusCode,
+    resHeaders: bgHeaderPairs(d.responseHeaders),
+    note: `Redirected to ${d.redirectUrl}`,
+  });
+  await bgNavSave(f);
+  if (f.hop + 1 >= BG_NAV_MAX_HOPS) { bgNavFlights.delete(d.requestId); return; }
+  const prev = f.rec;
+  const method = bgRedirectMethod(d.statusCode, prev.method);
+  f.hop++;
+  f.rec = bgNavRecord(f, d.redirectUrl, method, d.timeStamp, method === prev.method ? prev.reqBody ?? null : null);
+  await bgNavSave(f);
+}
+
+async function bgNavOnCompleted(d: chrome.webRequest.WebResponseCacheDetails): Promise<void> {
+  const f = bgNavFlights.get(d.requestId);
+  if (!f) return;
+  bgNavFlights.delete(d.requestId);
+  bgNavFinish(f, d.timeStamp, { status: d.statusCode, resHeaders: bgHeaderPairs(d.responseHeaders) });
+  await bgNavSave(f);
+}
+
+async function bgNavOnError(d: chrome.webRequest.WebResponseErrorDetails): Promise<void> {
+  const f = bgNavFlights.get(d.requestId);
+  if (!f) return;
+  bgNavFlights.delete(d.requestId);
+  bgNavFinish(f, d.timeStamp, { status: 'error', note: d.error });
+  await bgNavSave(f);
+}
+
+// Listeners are async (the allowlist read), so run every event through one
+// queue: onSendHeaders must not overtake the onBeforeRequest that opened the row.
+let bgNavQueue: Promise<void> = Promise.resolve();
+
+function bgNavEnqueue<T>(handler: (d: T) => Promise<void>): (d: T) => void {
+  return d => { bgNavQueue = bgNavQueue.then(() => handler(d)).catch(() => { /* keep the queue alive */ }); };
+}
+
+if (chrome.webRequest) {
+  const filter: chrome.webRequest.RequestFilter = { urls: ['<all_urls>'], types: ['main_frame'] };
+  chrome.webRequest.onBeforeRequest.addListener(bgNavEnqueue(bgNavOnBeforeRequest), filter, ['requestBody']);
+  chrome.webRequest.onSendHeaders.addListener(bgNavEnqueue(bgNavOnSendHeaders), filter, ['requestHeaders']);
+  chrome.webRequest.onBeforeRedirect.addListener(bgNavEnqueue(bgNavOnBeforeRedirect), filter, ['responseHeaders']);
+  chrome.webRequest.onCompleted.addListener(bgNavEnqueue(bgNavOnCompleted), filter, ['responseHeaders']);
+  chrome.webRequest.onErrorOccurred.addListener(bgNavEnqueue(bgNavOnError), filter);
+}
