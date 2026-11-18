@@ -5,7 +5,8 @@ A Chrome extension that intercepts and displays all API calls made by a web page
 ## Features
 
 - **Allowlist-only activation** — the overlay is completely dormant on all sites by default; you explicitly add hostnames you want to inspect
-- **Live request capture** — intercepts `fetch`, `XMLHttpRequest`, and `WebSocket` traffic in real time
+- **Live request capture** — intercepts `fetch`, `XMLHttpRequest`, `WebSocket`, `EventSource` (server-sent events) and `navigator.sendBeacon` traffic in real time
+- **Page navigations** — document loads, classic `<form>` submits and their redirects are listed as `doc` rows (from `chrome.webRequest`), so server-rendered sites show the requests the page's JS never makes. Extensions can't read a document's response body in MV3, so these rows carry URL, method, form body, headers, status and timing only
 - **Trigger element linking** — identifies which DOM element the user interacted with that caused each request, with hover-to-highlight on page
 - **Floating overlay panel** — draggable, dark/light-themed panel rendered on top of any allowed site; no DevTools required
 - **Request/response body preview** — click any row to expand and see payload; JSON is auto-pretty-printed
@@ -44,7 +45,9 @@ The extension uses a two-script architecture — Manifest V3 keeps content scrip
 
 2. **`content.ts`** runs in the **content script world** (isolated from the page). It listens for those `window.postMessage` events and builds the overlay panel into the page DOM. It also tracks interaction state (hover → highlight, expand/collapse rows) and responds to commands from the popup.
 
-3. **`popup.ts`** controls the extension popup, which sends `chrome.tabs.sendMessage` commands (`activate`, `deactivate`, `toggle`, `pause`, `clear`, `export-har`) to the content script. It also manages the `ovAllowedHosts` allowlist in `chrome.storage.local`.
+3. **`background.ts`** (service worker) keeps the per-tab preserve log, and observes main-frame navigations through `chrome.webRequest` for allowlisted hosts. Each navigation hop is written into the tab's log and pushed to the page as an `ov-nav` message.
+
+4. **`popup.ts`** controls the extension popup, which sends `chrome.tabs.sendMessage` commands (`activate`, `deactivate`, `toggle`, `pause`, `clear`, `export-har`) to the content script. It also manages the `ovAllowedHosts` allowlist in `chrome.storage.local`.
 
 ```
 Page JS ──postMessage──▶ content.ts ──renders──▶ overlay panel

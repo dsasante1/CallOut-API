@@ -491,6 +491,8 @@ function smFoldInto(page: SmPage, r: SmFoldable, countIt: boolean): void {
 // not per call, so it stays complete long after the log has rolled over.
 function smFoldRequest(r: ApiRequest): void {
   if (r.status === 'pending') return;
+  // A document load is the page itself, not an endpoint the page calls.
+  if (r.kind === 'nav') return;
   const pageUrl = r.pageUrl || location.href;
   const page = smEnsurePage(smRouteKey(pageUrl), pageUrl, 'visited');
   page.scanned = true;

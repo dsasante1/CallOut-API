@@ -23,6 +23,7 @@ const EXPORTED = [
   'selectorBadges', 'selectorReqIds', 'clusterBadgeRowHtml', 'refreshPill',
   'startMutationLog', 'renderFootprints', 'runBulkHighlight',
   'handleJsonValueClick', 'bindListDelegation', 'revealBarHtml', 'syncRevealBar', 'commitPanelDodge',
+  'smPages',
 ] as const
 
 export type OverlayApi = Record<(typeof EXPORTED)[number], any>

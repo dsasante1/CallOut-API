@@ -468,4 +468,87 @@ interface XMLHttpRequest {
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (window as any).WebSocket = WebSocketProxy;
+
+  // ── sendBeacon ──
+  // Fire-and-forget: the browser only says whether it queued the beacon, never
+  // how the server answered, so the row ends at 'sent' (or 'error' if refused).
+  const _sendBeacon = typeof navigator.sendBeacon === 'function' ? navigator.sendBeacon : null;
+  if (_sendBeacon) {
+    navigator.sendBeacon = function (url: string | URL, data?: BodyInit | null): boolean {
+      const queued = _sendBeacon.call(navigator, url, data);
+      if (stopped || !capturing) return queued;
+      const id = ++requestId;
+      const reqBody = extractBody(data);
+      emit({ id, url: String(url), method: 'POST', kind: 'beacon', status: queued ? 'sent' : 'error',
+             element: elementInfo(getInteractedElement()), ts: Date.now(), reqBody });
+      // Analytics beacons are usually a JSON Blob, which can only be read async.
+      if (data instanceof Blob && data.size <= MAX_BODY_BYTES && (!data.type || TEXTLIKE_CT.test(data.type))) {
+        data.text().then(text => { emit({ id, reqBody: text }); }).catch(() => {});
+      }
+      return queued;
+    };
+  }
+
+  // ── EventSource (server-sent events) ──
+  // Shown like a WebSocket: one row per connection, events as received frames.
+  // A named event (`event: foo`) never reaches 'message' listeners, so each type
+  // the page subscribes to is recorded too.
+  if (typeof window.EventSource === 'function') {
+    const _EventSource = window.EventSource;
+    class EventSourceProxy extends _EventSource {
+      private __ov_base: Record<string, unknown> | null = null;
+
+      constructor(url: string | URL, init?: EventSourceInit) {
+        super(url, init);
+        if (stopped || !capturing) return;
+        const id = ++requestId;
+        const t0 = Date.now();
+        const base = { id, url: this.url, method: 'GET', kind: 'sse', element: elementInfo(getInteractedElement()), ts: t0 };
+        this.__ov_base = base;
+
+        emit({ ...base, status: 'pending' });
+
+        // EventSource only opens on a 200 text/event-stream response.
+        _EventSource.prototype.addEventListener.call(this, 'open', () => {
+          if (stopped) return;
+          emit({ ...base, status: 200, ms: Date.now() - t0 });
+        });
+        // CONNECTING after an error means the browser is retrying; CLOSED is final.
+        _EventSource.prototype.addEventListener.call(this, 'error', () => {
+          if (stopped) return;
+          const final = this.readyState === _EventSource.CLOSED;
+          emit({ ...base, status: final ? 'error' : 'pending', ms: Date.now() - t0 });
+        });
+
+        const recorded = new Set<string>(['open', 'error']);
+        const record = (e: Event): void => {
+          if (stopped || !capturing) return;
+          const data = String((e as MessageEvent).data ?? '');
+          const body = (e.type === 'message' ? data : `[${e.type}] ${data}`).slice(0, MAX_WS_BODY_BYTES);
+          emit({ __wsMsg: true, wsId: id, dir: 'recv', body, ts: Date.now() });
+        };
+        const watch = (type: string): void => {
+          if (recorded.has(type)) return;
+          recorded.add(type);
+          _EventSource.prototype.addEventListener.call(this, type, record);
+        };
+        watch('message');
+        const add = this.addEventListener;
+        this.addEventListener = function (this: EventSource, type: string, ...rest: unknown[]): void {
+          watch(type);
+          (add as (...a: unknown[]) => void).apply(this, [type, ...rest]);
+        } as EventSource['addEventListener'];
+      }
+
+      close(): void {
+        const base = this.__ov_base;
+        const wasOpen = this.readyState !== _EventSource.CLOSED;
+        super.close();
+        if (base && wasOpen && !stopped) emit({ ...base, status: 'closed', ms: Date.now() - (base.ts as number) });
+      }
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (window as any).EventSource = EventSourceProxy;
+  }
 })();
